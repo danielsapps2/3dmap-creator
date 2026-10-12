@@ -5,8 +5,10 @@ import { Terrain } from './Terrain.js';
 import { History } from './History.js';
 import { AssetLibrary } from './AssetLibrary.js';
 import {
-  createEntity, serializeEntity, deserializeEntity, applyEntityState, disposeEntity, isEditorOnly, entityBounds,
+  createEntity, serializeEntity, applyEntityState, disposeEntity, isEditorOnly, entityBounds, buildEntities,
+  childEntities, entitySubtree, parentEntity, findOwn, isWithin, isShown,
 } from './Entities.js';
+import { poseCharacter, gripTransform, entityRig, entityProp, socketForHand } from './Rig.js';
 import { uid } from '../core/utils.js';
 
 export const DEFAULT_ENV = {
@@ -131,6 +133,10 @@ export class Editor extends EventTarget {
     this._ghost = null;
     this._placeSpec = null;
 
+    // Rigged models are re-posed (idle frame + the props they hold) on the next frame after anything changes.
+    this._posesDirty = true;
+    for (const ev of ['sceneChanged', 'objectChanged', 'objectTransformed']) this.addEventListener(ev, () => { this._posesDirty = true; });
+
     this.applyEnvironment();
     this._bindEvents();
     new ResizeObserver(() => this._resize()).observe(container);
@@ -232,9 +238,9 @@ export class Editor extends EventTarget {
     this.emit('snapChanged');
   }
 
-  /** Round X/Z position, rotation and scale of the selected (or given) objects to the current snap steps. */
+  /** Round X/Z position (in the world), rotation and scale of the selected (or given) objects to the snap steps. */
   snapToGrid(objs = this.selection) {
-    this.batchEdit(objs, 'Snap', (obj) => {
+    this.batchEdit(this.topmost(objs).filter((o) => !o.entity.attach), 'Snap', (obj) => {
       const { translate: t, rotate, scale: sc } = this.snap;
       const r = THREE.MathUtils.degToRad(rotate);
       const round = (v, step) => Math.round(v / step) * step;
@@ -242,21 +248,38 @@ export class Editor extends EventTarget {
       obj.scale.set(
         Math.max(sc, round(obj.scale.x, sc)), Math.max(sc, round(obj.scale.y, sc)), Math.max(sc, round(obj.scale.z, sc)),
       );
-      const off = this._gridOffset([obj], obj.position);
-      obj.position.x = alignToGrid(obj.position.x, off.x, t);
-      obj.position.z = alignToGrid(obj.position.z, off.z, t);
+      const p = obj.getWorldPosition(new THREE.Vector3()), off = this._gridOffset([obj], p);
+      p.x = alignToGrid(p.x, off.x, t);
+      p.z = alignToGrid(p.z, off.z, t);
+      obj.position.copy(obj.parent.worldToLocal(p));
     });
   }
 
   // ---------------------------------------------------------------- objects
 
-  get objects() { return this.objectsRoot.children; }
+  /** Top-level entities. */
+  get roots() { return this.objectsRoot.children; }
 
-  uniqueName(base) {
+  /** Every entity, parents before their children. */
+  get objects() {
+    const out = [];
+    for (const r of this.roots) entitySubtree(r, out);
+    return out;
+  }
+
+  /** In the scene (not deleted, not a placement ghost). */
+  inScene(obj) { return isWithin(obj, this.objectsRoot); }
+
+  /** The objects without those that have an ancestor among them (moving a parent moves its children). */
+  topmost(objs = this.selection) {
+    objs = toList(objs);
+    return objs.filter((o) => !objs.some((p) => p !== o && isWithin(o, p)));
+  }
+
+  uniqueName(base, taken = new Set(this.objects.map((o) => o.name))) {
     base = base.replace(/\s\d+$/, '');
-    const names = new Set(this.objects.map((o) => o.name));
-    if (!names.has(base)) return base;
-    for (let i = 2; ; i++) if (!names.has(`${base} ${i}`)) return `${base} ${i}`;
+    if (!taken.has(base)) return base;
+    for (let i = 2; ; i++) if (!taken.has(`${base} ${i}`)) return `${base} ${i}`;
   }
 
   createEntity(spec) {
@@ -269,14 +292,20 @@ export class Editor extends EventTarget {
     this.addObjects([obj], opts);
   }
 
+  /** Add entities (with their children) at the top level, or under `obj.__home` when that is set (copies, held props). */
   addObjects(objs, { select = true, record = true } = {}) {
     if (!objs.length) return;
-    objs.forEach((o) => this._attach(o));
+    const homes = objs.map((o) => {
+      const home = o.__home ?? this.objectsRoot;
+      delete o.__home;
+      return home;
+    });
+    objs.forEach((o, i) => this._attach(o, homes[i]));
     if (record) {
       this.history.push({
         label: objs.length === 1 ? `Add ${objs[0].name}` : `Add ${objs.length} objects`,
         undo: () => objs.forEach((o) => this._detach(o)),
-        redo: () => objs.forEach((o) => this._attach(o)),
+        redo: () => objs.forEach((o, i) => this._attach(o, homes[i])),
       });
     }
     if (select) this.setSelection(objs);
@@ -286,22 +315,24 @@ export class Editor extends EventTarget {
     if (obj) this.removeObjects([obj]);
   }
 
+  /** Delete entities and everything below them. */
   removeObjects(objs) {
+    objs = this.topmost(objs).filter((o) => this.inScene(o));
     if (!objs.length) return;
     // Re-inserting in ascending index order on undo puts every object back exactly where it was.
-    const entries = objs.map((o) => ({ o, index: this.objects.indexOf(o) })).sort((a, b) => a.index - b.index);
+    const entries = objs.map((o) => ({ o, parent: o.parent, index: o.parent.children.indexOf(o) })).sort((a, b) => a.index - b.index);
     entries.forEach((e) => this._detach(e.o));
     this.history.push({
       label: objs.length === 1 ? `Delete ${objs[0].name}` : `Delete ${objs.length} objects`,
-      undo: () => entries.forEach((e) => this._attach(e.o, e.index)),
+      undo: () => entries.forEach((e) => this._attach(e.o, e.parent, e.index)),
       redo: () => entries.forEach((e) => this._detach(e.o)),
     });
   }
 
-  _attach(obj, index = -1) {
-    this.objectsRoot.add(obj);
+  _attach(obj, parent = this.objectsRoot, index = -1) {
+    parent.add(obj);
     if (index >= 0) {
-      const arr = this.objectsRoot.children;
+      const arr = parent.children;
       arr.splice(arr.indexOf(obj), 1);
       arr.splice(Math.min(index, arr.length), 0, obj);
     }
@@ -309,8 +340,8 @@ export class Editor extends EventTarget {
   }
 
   _detach(obj) {
-    if (this.isSelected(obj)) this.setSelection(this.selection.filter((o) => o !== obj));
-    this.objectsRoot.remove(obj);
+    if (this.selection.some((o) => isWithin(o, obj))) this.setSelection(this.selection.filter((o) => !isWithin(o, obj)));
+    obj.removeFromParent();
     this.emit('sceneChanged');
   }
 
@@ -326,18 +357,26 @@ export class Editor extends EventTarget {
     return copies[copies.length - 1];
   }
 
-  /** Copies of entities with new ids and unique names, not yet added to the scene. */
+  /**
+   * Copies of entities and everything below them, with new ids and unique names, not yet added to the scene. Each
+   * copy's `__home` is where its original sits, so addObjects puts it next to it.
+   */
   _cloneEntities(objs) {
-    const copies = objs.map((src) => {
-      const data = serializeEntity(src);
-      data.id = uid();
-      data.name = this.uniqueName(src.name);
-      const copy = deserializeEntity(data, this.assets);
-      this.objectsRoot.add(copy); // so uniqueName sees it for the next copy
+    const taken = new Set(this.objects.map((o) => o.name));
+    return this.topmost(objs).map((src) => {
+      const list = entitySubtree(src).map(serializeEntity);
+      const ids = new Map(list.map((d) => [d.id, uid()]));
+      for (const d of list) {
+        d.id = ids.get(d.id);
+        d.parent = ids.get(d.parent) ?? null;
+        d.name = this.uniqueName(d.name, taken);
+        taken.add(d.name);
+      }
+      const copy = buildEntities(list, this.assets).roots[0];
+      copy.entity.attach = src.entity.attach;
+      copy.__home = src.parent;
       return copy;
     });
-    copies.forEach((c) => this.objectsRoot.remove(c));
-    return copies;
   }
 
   /** Push an undoable state change for an entity (before = serializeEntity() taken earlier). */
@@ -375,6 +414,160 @@ export class Editor extends EventTarget {
     if (this.selection.length > 1 && !this._drag) this._attachGizmo();
   }
 
+  // ---------------------------------------------------------------- hierarchy
+
+  /**
+   * Make objs children of `parent` (null = top level), keeping where they are in the world. A holdable prop given
+   * to a character with hand sockets goes into a free hand instead, its grip on the socket (hold: false to just
+   * parent it).
+   */
+  setParent(objs, parent, { hold = true } = {}) {
+    objs = this.topmost(objs).filter((o) => this.inScene(o) && o !== parent && !(parent && isWithin(parent, o)) && parentEntity(o) !== parent);
+    if (!objs.length) return;
+    const rig = entityRig(parent, this.assets);
+    this._restructure(objs, parent ? `Parent to ${parent.name}` : 'Unparent', (o) => {
+      const prop = hold && entityProp(o, this.assets);
+      o.entity.attach = null;
+      (parent ?? this.objectsRoot).attach(o);
+      const hand = prop && rig && this.freeHand(parent, prop.hand);
+      if (hand && rig.sockets.includes(socketForHand(hand))) this._attachTo(o, socketForHand(hand), true);
+    });
+  }
+
+  /** Attach a child entity to one of its parent's bones (null: back onto the parent itself) as one undo step. */
+  attachTo(obj, bone, { snap = false } = {}) {
+    if (!parentEntity(obj)) return;
+    this._restructure([obj], bone ? `Attach to ${bone}` : 'Detach from bone', (o) => this._attachTo(o, bone, snap));
+  }
+
+  /** Put a held prop's grip back on its hand socket. */
+  snapToGrip(obj) {
+    this.batchEdit(obj, 'Snap grip', (o) => this._snapGrip(o));
+  }
+
+  /** Give a character a new copy of a prop asset, held in its hand. */
+  holdProp(character, assetId, hand, { select = true } = {}) {
+    const socket = findOwn(character, socketForHand(hand));
+    if (!socket) return null;
+    const prop = this.createEntity({ kind: 'asset', assetId, attach: socket.name, props: { collider: 'none' } });
+    this._snapGrip(prop);
+    prop.__home = socket;
+    this.addObjects([prop], { select });
+    return prop;
+  }
+
+  /** The rigged model that plays the player under a Player Spawn (the first one among its children), if any. */
+  playerModel(spawn) {
+    return childEntities(spawn).find((o) => entityRig(o, this.assets)) ?? null;
+  }
+
+  /**
+   * Make a rigged asset the player under a spawn, as one undo step. A model already there is replaced and hands
+   * over its children: whatever it holds goes into the new model's same socket (grip re-snapped).
+   */
+  setPlayerModel(spawn, assetId) {
+    const old = this.playerModel(spawn);
+    const model = this.createEntity({ kind: 'asset', assetId, rotation: [0, Math.PI, 0] }); // characters face +Z, spawns −Z
+    if (old) {
+      model.position.copy(old.position);
+      model.quaternion.copy(old.quaternion);
+    }
+    const kids = old ? childEntities(old) : [];
+    const where = (o) => ({ parent: o.parent, index: o.parent.children.indexOf(o), state: serializeEntity(o) });
+    const before = kids.map(where), oldAt = old && { parent: old.parent, index: old.parent.children.indexOf(old) };
+    spawn.add(model);
+    model.updateMatrixWorld(true);
+    for (const k of kids) {
+      const socket = k.entity.attach ? findOwn(model, k.entity.attach) : null;
+      if (!socket) k.entity.attach = null;
+      (socket ?? model).add(k); // same local transform on the new model
+      if (socket && entityProp(k, this.assets)) this._snapGrip(k);
+    }
+    const after = kids.map(where);
+    if (old) this._detach(old);
+    const swap = (list, add, remove, at) => {
+      if (remove) this._detach(remove);
+      if (add) this._place(add, at.parent, at.index);
+      kids.forEach((k, i) => { this._place(k, list[i].parent, list[i].index); applyEntityState(k, list[i].state); });
+      this.emit('sceneChanged');
+    };
+    const modelAt = { parent: spawn, index: spawn.children.indexOf(model) };
+    this.history.push({
+      label: old ? `Replace player model with ${model.name}` : `Player model ${model.name}`,
+      undo: () => swap(before, old, model, oldAt),
+      redo: () => swap(after, model, old, modelAt),
+    });
+    this.emit('sceneChanged');
+    return model;
+  }
+
+  /** Re-pose characters on the next frame (live previews of hold edits that aren't committed yet). */
+  requestPose() { this._posesDirty = true; }
+
+  _place(obj, parent, index) {
+    parent.add(obj);
+    const arr = parent.children;
+    arr.splice(arr.indexOf(obj), 1);
+    arr.splice(Math.min(index, arr.length), 0, obj);
+  }
+
+  /** The hand to put a prop in: `preferred`, unless it already holds something and the other hand doesn't. */
+  freeHand(character, preferred = 'Right') {
+    const holding = new Set(childEntities(character).map((c) => c.entity.attach));
+    const other = preferred === 'Left' ? 'Right' : 'Left';
+    return holding.has(socketForHand(preferred)) && !holding.has(socketForHand(other)) ? other : preferred;
+  }
+
+  _attachTo(obj, bone, snap) {
+    const parent = parentEntity(obj), node = bone ? findOwn(parent, bone) : null;
+    obj.entity.attach = node ? bone : null;
+    (node ?? parent).attach(obj); // keeps its world transform
+    if (node && snap) {
+      this._snapGrip(obj);
+      if (obj.entity.props.collider === 'box') obj.entity.props.collider = 'none'; // a held prop shouldn't block its holder
+    }
+  }
+
+  _snapGrip(obj) {
+    const t = gripTransform(obj);
+    if (!t) return;
+    obj.position.copy(t.position);
+    obj.quaternion.copy(t.quaternion);
+    obj.scale.setScalar(t.scale);
+  }
+
+  /** Move entities around the hierarchy as one undo step; fn(obj) re-parents each one (and may edit it). */
+  _restructure(objs, label, fn) {
+    const where = (o) => ({ parent: o.parent, index: o.parent.children.indexOf(o), state: serializeEntity(o) });
+    const befores = objs.map(where);
+    objs.forEach(fn);
+    const afters = objs.map(where);
+    const apply = (list) => {
+      // ascending index order, so siblings land back exactly where they were
+      [...objs.keys()].sort((a, b) => list[a].index - list[b].index).forEach((i) => {
+        const o = objs[i], { parent, index, state } = list[i];
+        this._place(o, parent, index);
+        applyEntityState(o, state);
+      });
+      this.emit('sceneChanged');
+      this._statesChanged(objs);
+    };
+    this.history.push({
+      label: objs.length === 1 ? `${label}: ${objs[0].name}` : `${label}: ${objs.length} objects`,
+      undo: () => apply(befores),
+      redo: () => apply(afters),
+    });
+    this.emit('sceneChanged');
+    this._statesChanged(objs);
+  }
+
+  /** Re-pose rigged models (first Idle frame, then the props in their hands) if anything changed since. */
+  updatePoses() {
+    if (!this._posesDirty) return;
+    this._posesDirty = false;
+    for (const o of this.objects) if (entityRig(o, this.assets)) poseCharacter(o, this.assets);
+  }
+
   // ---------------------------------------------------------------- selection
 
   get selected() { return this.selection[this.selection.length - 1] ?? null; }
@@ -392,7 +585,7 @@ export class Editor extends EventTarget {
   }
 
   selectAll() {
-    this.setSelection(this.objects.filter((o) => o.visible));
+    this.setSelection(this.objects.filter(isShown));
   }
 
   setSelection(objs) {
@@ -451,7 +644,7 @@ export class Editor extends EventTarget {
     const [minX, maxX] = [Math.min(x0, x1), Math.max(x0, x1)], [minY, maxY] = [Math.min(y0, y1), Math.max(y0, y1)];
     const v = new THREE.Vector3(), box = new THREE.Box3();
     const hits = this.objects.filter((o) => {
-      if (!o.visible) return false;
+      if (!isShown(o)) return false;
       entityBounds(o, box).getCenter(v).project(this.camera);
       if (v.z < -1 || v.z > 1) return false; // behind the camera
       const sx = r.left + ((v.x + 1) / 2) * r.width, sy = r.top + ((1 - v.y) / 2) * r.height;
@@ -464,13 +657,14 @@ export class Editor extends EventTarget {
 
   _beginGizmoDrag() {
     const tc = this.transform;
-    let objs = [...this.selection], duplicated = null;
+    let objs = this.topmost(this.selection), duplicated = null;
     if (this._altHeld && objs.length) {
       // Alt+drag: leave the originals in place and drag copies of them instead. The copies have identical transforms,
       // so swapping the gizmo onto them mid-press keeps the drag's start state valid.
       const copies = this._cloneEntities(objs);
-      copies.forEach((c) => this._attach(c));
-      duplicated = { originals: objs, copies };
+      const homes = copies.map((c) => c.__home);
+      copies.forEach((c, i) => { delete c.__home; this._attach(c, homes[i]); });
+      duplicated = { originals: objs, copies, homes };
       this.setSelection(copies);
       objs = copies;
     }
@@ -485,7 +679,9 @@ export class Editor extends EventTarget {
       objStarts: objs.map((o) => o.matrixWorld.clone()),
       anchorLocal: null,
       anchorWorld: null,
-      gridOffset: tc.mode === 'translate' ? this._gridOffset(objs, target.position) : null,
+      // Bounds-edge grid snapping works in world X/Z, so only for top-level objects (and the multi-selection pivot).
+      gridOffset: tc.mode === 'translate' && (target === this.pivot || target.parent === this.objectsRoot)
+        ? this._gridOffset(objs, target.position) : null,
     });
     if (tc.mode === 'scale' && tc.axis) {
       // One-sided scaling (hold Shift): the face opposite the grabbed handle stays put.
@@ -507,7 +703,8 @@ export class Editor extends EventTarget {
       t.position.copy(d.startPos);
       if (this._shiftHeld) {
         t.updateMatrixWorld();
-        t.position.add(d.anchorWorld.clone().sub(t.localToWorld(d.anchorLocal.clone())));
+        const want = t.parent.worldToLocal(d.anchorWorld.clone());
+        t.position.add(want.sub(t.parent.worldToLocal(t.localToWorld(d.anchorLocal.clone()))));
       }
     }
     if (d.gridOffset && this.snapActive) {
@@ -520,9 +717,11 @@ export class Editor extends EventTarget {
     t.updateMatrixWorld();
     if (t === this.pivot) {
       const delta = new THREE.Matrix4().multiplyMatrices(t.matrixWorld, d.startInverse);
-      const m = new THREE.Matrix4();
+      const m = new THREE.Matrix4(), toParent = new THREE.Matrix4();
       d.objs.forEach((o, i) => {
-        m.multiplyMatrices(delta, d.objStarts[i]).decompose(o.position, o.quaternion, o.scale);
+        o.parent.updateWorldMatrix(true, false);
+        toParent.copy(o.parent.matrixWorld).invert();
+        m.multiplyMatrices(delta, d.objStarts[i]).premultiply(toParent).decompose(o.position, o.quaternion, o.scale);
       });
     }
   }
@@ -538,7 +737,7 @@ export class Editor extends EventTarget {
 
   /** Alt+drag result: one undo step that adds the moved copies (or nothing if they never moved). */
   _finishDuplicateDrag(d) {
-    const { originals, copies } = d.duplicated;
+    const { originals, copies, homes } = d.duplicated;
     const moved = copies.some((c, i) => JSON.stringify(serializeEntity(c)) !== JSON.stringify(d.befores[i]));
     if (!moved) {
       copies.forEach((c) => { this._detach(c); disposeEntity(c); });
@@ -547,8 +746,8 @@ export class Editor extends EventTarget {
     }
     this.history.push({
       label: copies.length === 1 ? `Duplicate ${originals[0].name}` : `Duplicate ${copies.length} objects`,
-      undo: () => { copies.forEach((c) => this._detach(c)); this.setSelection(originals.filter((o) => o.parent === this.objectsRoot)); },
-      redo: () => { copies.forEach((c) => this._attach(c)); this.setSelection(copies); },
+      undo: () => { copies.forEach((c) => this._detach(c)); this.setSelection(originals.filter((o) => this.inScene(o))); },
+      redo: () => { copies.forEach((c, i) => this._attach(c, homes[i])); this.setSelection(copies); },
     });
     this._statesChanged(copies);
   }
@@ -574,19 +773,19 @@ export class Editor extends EventTarget {
     return { x: box.min.x - origin.x, z: box.min.z - origin.z };
   }
 
-  /** Bounds of objs expressed in target's local space. */
+  /** Bounds of objs expressed in target's local space (their own parts, like entityBounds). */
   _boundsIn(target, objs) {
     const inv = target.matrixWorld.clone().invert();
     const box = new THREE.Box3(), tmp = new THREE.Box3(), m = new THREE.Matrix4();
-    const visit = (o) => {
-      if (o.userData.noBounds) return;
+    const visit = (o, root) => {
+      if (o.userData.noBounds || (o !== root && o.entity && root.entity?.kind !== 'group')) return;
       if (o.geometry) {
         if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
         box.union(tmp.copy(o.geometry.boundingBox).applyMatrix4(m.multiplyMatrices(inv, o.matrixWorld)));
       }
-      o.children.forEach(visit);
+      o.children.forEach((c) => visit(c, root));
     };
-    objs.forEach((o) => { o.updateWorldMatrix(true, true); visit(o); });
+    objs.forEach((o) => { o.updateWorldMatrix(true, true); visit(o, o); });
     if (box.isEmpty()) box.set(new THREE.Vector3(), new THREE.Vector3());
     return box;
   }
@@ -602,18 +801,17 @@ export class Editor extends EventTarget {
     this.camera.position.copy(center).addScaledVector(dir, radius * 2.6);
   }
 
-  /** Drop objects so their bounding-box bottom rests on the surface below them. */
+  /** Drop objects so their bounding-box bottom rests on the surface below them (children follow their parent). */
   dropToGround(objs = this.selection) {
-    this.batchEdit(objs, 'Drop', (obj) => {
+    this.batchEdit(this.topmost(objs).filter((o) => !o.entity.attach), 'Drop', (obj) => {
       const box = entityBounds(obj);
       if (box.isEmpty()) return;
-      const origin = new THREE.Vector3(obj.position.x, box.min.y + 0.01, obj.position.z);
-      this.raycaster.set(origin, new THREE.Vector3(0, -1, 0));
-      const targets = [this.terrain.mesh, ...this.objects.filter((o) => o !== obj)];
-      const hit = this._firstValidHit(this.raycaster.intersectObjects(targets, true), false);
-      const groundY = hit ? hit.point.y
-        : this.terrain.contains(obj.position.x, obj.position.z) ? this.terrain.getHeightAt(obj.position.x, obj.position.z) : 0;
-      obj.position.y += groundY - box.min.y;
+      const p = obj.getWorldPosition(new THREE.Vector3());
+      this.raycaster.set(new THREE.Vector3(p.x, box.min.y + 0.01, p.z), new THREE.Vector3(0, -1, 0));
+      const hit = this._firstValidHit(this.raycaster.intersectObjects([this.terrain.mesh, ...this.roots], true), false, obj);
+      const groundY = hit ? hit.point.y : this.terrain.contains(p.x, p.z) ? this.terrain.getHeightAt(p.x, p.z) : 0;
+      p.y += groundY - box.min.y;
+      obj.position.copy(obj.parent.worldToLocal(p));
       obj.updateMatrixWorld(true);
     });
   }
@@ -628,7 +826,7 @@ export class Editor extends EventTarget {
   clearAll() {
     this.setMode('select');
     this.select(null);
-    for (const obj of [...this.objects]) {
+    for (const obj of [...this.roots]) {
       this.objectsRoot.remove(obj);
       disposeEntity(obj);
     }
@@ -687,6 +885,7 @@ export class Editor extends EventTarget {
     obj.scale.setScalar(s || 1);
     obj.rotation.y = this._ghostYaw;
     obj.visible = false;
+    if (entityRig(obj, this.assets)) poseCharacter(obj, this.assets);
     this._ghost = obj;
     this.ghostRoot.add(obj);
     this._updateGhost();
@@ -744,8 +943,10 @@ export class Editor extends EventTarget {
     this.raycaster.setFromCamera(this.pointer, this.camera);
   }
 
-  _firstValidHit(hits, allowEditorOnly) {
+  /** First hit on something visible, optionally skipping editor-only helpers and anything within `exclude`. */
+  _firstValidHit(hits, allowEditorOnly, exclude = null) {
     for (const h of hits) {
+      if (exclude && isWithin(h.object, exclude)) continue;
       let o = h.object, ok = true;
       while (o) { if (!o.visible) { ok = false; break; } o = o.parent; }
       if (!ok) continue;
@@ -762,7 +963,7 @@ export class Editor extends EventTarget {
 
   raycastPlacement() {
     this._setRayFromPointer();
-    const hit = this._firstValidHit(this.raycaster.intersectObjects([this.terrain.mesh, ...this.objects], true), false);
+    const hit = this._firstValidHit(this.raycaster.intersectObjects([this.terrain.mesh, ...this.roots], true), false);
     if (hit) return hit;
     const p = new THREE.Vector3();
     if (this.raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), p)) return { point: p, face: null, object: null };
@@ -772,18 +973,16 @@ export class Editor extends EventTarget {
   /** Highest surface (terrain or object) at x,z. */
   surfaceHeightAt(x, z, exclude = null) {
     this.raycaster.set(new THREE.Vector3(x, 10000, z), new THREE.Vector3(0, -1, 0));
-    const targets = [this.terrain.mesh, ...this.objects.filter((o) => o !== exclude)];
-    const hit = this._firstValidHit(this.raycaster.intersectObjects(targets, true), false);
+    const hit = this._firstValidHit(this.raycaster.intersectObjects([this.terrain.mesh, ...this.roots], true), false, exclude);
     return hit ? hit.point.y : null;
   }
 
   pickObject() {
     this._setRayFromPointer();
-    const hit = this._firstValidHit(this.raycaster.intersectObjects(this.objects, true), true);
-    if (!hit) return null;
-    let o = hit.object;
-    while (o && o.parent !== this.objectsRoot) o = o.parent;
-    return o;
+    const hit = this._firstValidHit(this.raycaster.intersectObjects(this.roots, true), true);
+    let o = hit?.object;
+    while (o && !o.entity) o = o.parent; // the innermost entity: clicking a held sword selects the sword
+    return o ?? null;
   }
 
   // ---------------------------------------------------------------- input
@@ -881,7 +1080,7 @@ export class Editor extends EventTarget {
     // Put the orbit pivot back on whatever we're looking at, so orbit/zoom feel natural again.
     this.camera.getWorldDirection(_flyFwd);
     this.raycaster.set(this.camera.position, _flyFwd);
-    const hit = this._firstValidHit(this.raycaster.intersectObjects([this.terrain.mesh, ...this.objects], true), false);
+    const hit = this._firstValidHit(this.raycaster.intersectObjects([this.terrain.mesh, ...this.roots], true), false);
     const dist = hit && hit.distance < 1000 ? hit.distance : THREE.MathUtils.clamp(f.orbitDistance, 5, 200);
     this.orbit.target.copy(this.camera.position).addScaledVector(_flyFwd, dist);
   }
@@ -1042,6 +1241,7 @@ export class Editor extends EventTarget {
     }
     this._pointerDirty = false;
 
+    this.updatePoses();
     if (this.selection.length) this._updateSelectionBoxes();
     this.renderer.render(this.scene, this.camera);
   }

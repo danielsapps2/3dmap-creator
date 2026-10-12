@@ -19,7 +19,13 @@ export class AssetLibrary extends EventTarget {
     this._thumb = null;
   }
 
-  async add(fileName, buffer, id = uid()) {
+  /**
+   * meta: extra data saved with the asset, e.g. { tinyimgen: { id, role }, grip } for models pulled from tinyimgen
+   * (grip = the prop's grip.json). The asset also gets, from the model itself:
+   *   rig:  { bones: [names], sockets: [names] } when it has a skeleton (characters), else null
+   *   prop: { hands, hold, grip } when it has a Grip_Primary node (holdable props), else null
+   */
+  async add(fileName, buffer, id = uid(), meta = {}) {
     const gltf = await this.loader.parseAsync(buffer.slice(0), '');
     const scene = gltf.scene ?? gltf.scenes[0];
     scene.updateMatrixWorld(true);
@@ -39,6 +45,9 @@ export class AssetLibrary extends EventTarget {
       size,
       pivotOffset: new THREE.Vector3(center.x, box.isEmpty() ? 0 : box.min.y, center.z),
       thumbnail: null,
+      meta: meta ?? {},
+      rig: rigInfo(scene),
+      prop: propInfo(scene, meta),
     };
     try { asset.thumbnail = this._makeThumbnail(scene, box); } catch (e) { console.warn('thumbnail failed', e); }
     this.assets.set(id, asset);
@@ -47,6 +56,11 @@ export class AssetLibrary extends EventTarget {
   }
 
   get(id) { return this.assets.get(id); }
+
+  /** The library's copy of a tinyimgen model, if it was imported already. */
+  findTinyimgen(id, role) {
+    return this.list().find((a) => a.meta.tinyimgen?.id === id && a.meta.tinyimgen.role === role) ?? null;
+  }
   list() { return [...this.assets.values()]; }
 
   instantiate(id) {
@@ -94,4 +108,28 @@ export class AssetLibrary extends EventTarget {
     if (parent) parent.add(source);
     return renderer.domElement.toDataURL('image/png');
   }
+}
+
+/** Bones and attachment sockets of a rigged model (sockets first in `attachPoints`). */
+function rigInfo(scene) {
+  const bones = [], sockets = [];
+  scene.traverse((o) => {
+    if (o.isBone) bones.push(o.name);
+    else if (/_Socket$/.test(o.name) && o.parent?.isBone) sockets.push(o.name);
+  });
+  return bones.length ? { bones, sockets, attachPoints: [...sockets, ...bones] } : null;
+}
+
+/** Grip data of a holdable prop (tinyimgen's prop.glb: a "Prop" root with Grip_Primary / Grip_Secondary nodes). */
+function propInfo(scene, meta) {
+  const grip = scene.getObjectByName('Grip_Primary');
+  if (!grip) return null;
+  const extras = grip.parent?.userData ?? {};
+  const saved = meta?.grip ?? null;
+  return {
+    hands: saved?.hands ?? extras.hands ?? (scene.getObjectByName('Grip_Secondary') ? 2 : 1),
+    hold: saved?.hold ?? extras.hold ?? 'upright',
+    hand: saved?.hand === 'left' ? 'Left' : 'Right',
+    grip: saved,
+  };
 }

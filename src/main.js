@@ -6,7 +6,9 @@ import { Inspector } from './ui/Inspector.js';
 import { buildPanel, terrainPanel, assetsPanel, outliner } from './ui/Panels.js';
 import { h, button, toast, modal, numberInput, row, checkbox } from './ui/dom.js';
 import { downloadBlob, pickFiles, slug } from './core/utils.js';
-import { idbGet, idbSet } from './core/storage.js';
+import { idbGet, idbSet, idbDelete } from './core/storage.js';
+import { entitySubtree, isShown } from './editor/Entities.js';
+import { entityRig } from './editor/Rig.js';
 
 const $ = (id) => document.getElementById(id);
 const editor = new Editor($('viewport'));
@@ -83,9 +85,28 @@ function exportDialog() {
   });
 }
 
+/**
+ * The playtest's player: the first visible Player Spawn with a rigged model below it. The playtest plays that model
+ * (from its original GLB, which has the animations the exported map leaves out) and moves whatever it holds onto it.
+ */
+function playtestPlayer() {
+  for (const spawn of editor.objects) {
+    if (spawn.entity.kind !== 'marker' || spawn.entity.type !== 'spawn' || !isShown(spawn)) continue;
+    const character = entitySubtree(spawn).find((o) => o !== spawn && isShown(o) && entityRig(o, editor.assets));
+    if (!character) continue;
+    const asset = editor.assets.get(character.entity.assetId);
+    // its height in the editor: the asset's size times its world scale
+    const scale = character.getWorldScale(character.scale.clone()).y;
+    return { spawnId: spawn.entity.id, characterId: character.entity.id, name: character.name, buffer: asset.buffer, scale, height: asset.size.y * scale };
+  }
+  return null;
+}
+
 async function playtest() {
   try {
     const blob = await exportMap(editor, { binary: true, includeTerrain: true, includeMarkers: true });
+    const player = playtestPlayer();
+    await (player ? idbSet('playtest-player', player) : idbDelete('playtest-player'));
     await idbSet('playtest', await blob.arrayBuffer());
     window.open('./game.html?playtest=1', '3dmap-playtest');
   } catch (err) {
@@ -142,6 +163,7 @@ function showHelp() {
     ['W / E / R', 'Move / Rotate / Scale gizmo'], ['Q', 'Toggle world / local space'],
     ['X', 'Toggle grid snapping (move, rotate, scale, placement)'], ['Hold Ctrl', 'Temporarily flip snapping while dragging / placing'],
     ['Shift+S', 'Snap selected object to grid'],
+    ['Drag rows in the Scene list', 'Parent objects (drop a prop on a character to put it in their hand)'],
     ['B', 'Toggle sculpt mode'], ['[ / ]', 'Brush radius'], ['1–6', 'Brush tool (in sculpt mode)'],
     ['F', 'Focus selected (or whole map)'], ['G', 'Drop selected to ground'],
     ['Ctrl+D', 'Duplicate'], ['Delete / Backspace', 'Delete'], ['Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y', 'Undo / Redo'],
@@ -334,10 +356,12 @@ window.addEventListener('keydown', (e) => {
 // ------------------------------------------------------------------ drag & drop
 
 let dragDepth = 0;
-window.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; $('drop-overlay').hidden = false; });
-window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; $('drop-overlay').hidden = true; } });
-window.addEventListener('dragover', (e) => e.preventDefault());
+const fileDrag = (e) => e.dataTransfer?.types.includes('Files'); // not the Scene list's own drags
+window.addEventListener('dragenter', (e) => { if (!fileDrag(e)) return; e.preventDefault(); dragDepth++; $('drop-overlay').hidden = false; });
+window.addEventListener('dragleave', (e) => { if (fileDrag(e) && --dragDepth <= 0) { dragDepth = 0; $('drop-overlay').hidden = true; } });
+window.addEventListener('dragover', (e) => { if (fileDrag(e)) e.preventDefault(); });
 window.addEventListener('drop', async (e) => {
+  if (!fileDrag(e)) return;
   e.preventDefault();
   dragDepth = 0;
   $('drop-overlay').hidden = true;

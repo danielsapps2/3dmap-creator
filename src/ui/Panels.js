@@ -1,7 +1,9 @@
 import { h, row, section, numberInput, slider, colorInput, checkbox, select, textInput, button, toast, modal } from './dom.js';
 import { PRIMITIVES } from '../editor/Primitives.js';
 import { MARKERS } from '../editor/Markers.js';
-import { entityIcon } from '../editor/Entities.js';
+import { entityIcon, childEntities, parentEntity, isWithin } from '../editor/Entities.js';
+import { entityRig } from '../editor/Rig.js';
+import { tinyimgenCatalog, importTinyimgen } from '../editor/Tinyimgen.js';
 import { formatBytes } from '../core/utils.js';
 
 // ====================================================================== Build
@@ -17,6 +19,10 @@ export function buildPanel(root, editor) {
   };
   const po = editor.placeOptions;
   root.append(
+    section('Game objects', [
+      h('div', { class: 'tiles' }, tile('◇', 'Empty', { kind: 'group' }, 'Place an empty game object to group others under')),
+      h('p', { class: 'hint' }, 'Drag objects onto each other in the Scene list to make them children. Characters and holdable props from tinyimgen are in the Models tab.'),
+    ]),
     section('Primitives', h('div', { class: 'tiles' },
       ...Object.entries(PRIMITIVES).map(([type, d]) => tile(d.icon, d.label, { kind: 'primitive', type })))),
     section('Gameplay markers', h('div', { class: 'tiles' },
@@ -159,15 +165,83 @@ export function terrainPanel(root, editor, { importHeightmap, exportHeightmap })
 
 export function assetsPanel(root, editor, { importGLB }) {
   const list = h('div', { class: 'asset-list' });
+  const tiny = h('div', { class: 'tiny-body' });
   root.append(
     h('div', { class: 'dropzone', onclick: importGLB },
       h('strong', {}, 'Import GLB / glTF'),
       h('span', {}, 'Click or drop files anywhere on the window'),
     ),
-    list,
+    section('tinyimgen', tiny, { actions: button('↻', (e) => { e.preventDefault(); loadTiny(true); }, { cls: 'btn-ghost btn-sm', title: 'Refresh the list from tinyimgen' }) }),
+    section('Library', list),
   );
 
+  // tinyimgen's rigged characters and holdable props. Click one to place it; a prop clicked while a character is
+  // selected goes into that character's hand.
+  let catalog = null, error = null;
+  const busy = new Set();
+  const loadTiny = async (refresh = false) => {
+    tiny.replaceChildren(h('p', { class: 'hint' }, 'Looking for tinyimgen…'));
+    try {
+      catalog = await tinyimgenCatalog({ refresh });
+      error = null;
+    } catch (err) {
+      catalog = null;
+      error = err.message;
+    }
+    renderTiny();
+  };
+  const useItem = async (item) => {
+    const key = `${item.role}:${item.id}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+    renderTiny();
+    try {
+      const asset = await importTinyimgen(editor, item);
+      const holder = editor.selected && entityRig(editor.selected, editor.assets) ? editor.selected : null;
+      if (asset.prop && holder) {
+        const hand = editor.freeHand(holder, asset.prop.hand);
+        if (editor.holdProp(holder, asset.id, hand)) toast(`${holder.name} holds ${asset.name} in the ${hand.toLowerCase()} hand`, { type: 'ok' });
+        else editor.startPlacement({ kind: 'asset', assetId: asset.id });
+      } else {
+        editor.startPlacement({ kind: 'asset', assetId: asset.id });
+      }
+    } catch (err) {
+      console.error(err);
+      toast(`Couldn't import ${item.name}: ${err.message}`, { type: 'error', timeout: 6000 });
+    } finally {
+      busy.delete(key);
+      renderTiny();
+    }
+  };
+  const renderTiny = () => {
+    if (error) {
+      tiny.replaceChildren(h('p', { class: 'hint' }, `${error} at /tinyimgen. Start tinyimgen (server.py, port 7860) to use its characters and props.`),
+        button('Retry', () => loadTiny(true), { cls: 'btn-sm' }));
+      return;
+    }
+    if (!catalog) return;
+    const card = (item) => {
+      const inLib = !!editor.assets.findTinyimgen(item.id, item.role), loading = busy.has(`${item.role}:${item.id}`);
+      const what = item.role === 'prop' ? `${item.hands === 2 ? 'Two hands' : 'One hand'} · ${item.hold}` : 'Rigged character';
+      return h('button', { class: `tiny-card${loading ? ' busy' : ''}`, title: `${item.name} (tinyimgen ${item.id})`, onclick: () => useItem(item) },
+        item.thumb ? h('img', { src: item.thumb, alt: '', loading: 'lazy' }) : h('span', { class: 'thumb-ph' }, item.role === 'prop' ? '🗡' : '🧍'),
+        h('span', { class: 'tiny-name' }, item.name),
+        h('small', {}, loading ? 'Downloading…' : inLib ? `${what} · in library` : what));
+    };
+    const group = (title, items, empty) => [
+      h('div', { class: 'row-label sub' }, title),
+      items.length ? h('div', { class: 'tiny-grid' }, ...items.map(card)) : h('p', { class: 'hint' }, empty),
+    ];
+    tiny.replaceChildren(
+      ...group('Characters', catalog.characters, 'None yet: build a human with "Rig + animations" on.'),
+      ...group('Holdable props', catalog.props, 'None yet: open a 3D object in tinyimgen\'s Prop Editor (Make holdable ✋) and save its grips.'),
+      h('p', { class: 'hint' }, 'Click to place. With a character selected, clicking a prop puts it in their hand. You can also drag a prop onto a character in the Scene list.'),
+    );
+  };
+  loadTiny();
+
   const render = () => {
+    renderTiny();
     const assets = editor.assets.list();
     const counts = new Map();
     editor.objects.forEach((o) => { if (o.entity.kind === 'asset') counts.set(o.entity.assetId, (counts.get(o.entity.assetId) ?? 0) + 1); });
@@ -182,20 +256,21 @@ export function assetsPanel(root, editor, { importGLB }) {
         h('div', { class: 'asset-info' },
           h('strong', {}, a.name),
           h('small', {}, `${a.size.x.toFixed(1)} × ${a.size.y.toFixed(1)} × ${a.size.z.toFixed(1)} m · ${formatBytes(a.buffer.byteLength)}`),
-          h('small', {}, `${counts.get(a.id) ?? 0} placed${a.animations.length ? ` · ${a.animations.length} anim` : ''}`),
+          h('small', {}, [`${counts.get(a.id) ?? 0} placed`, a.rig && 'rigged', a.prop && `holdable (${a.prop.hands === 2 ? '2 hands' : '1 hand'})`,
+            a.animations.length && `${a.animations.length} anim`].filter(Boolean).join(' · ')),
         ),
         button('✕', (e) => {
           e.stopPropagation();
           const n = counts.get(a.id) ?? 0;
           const doIt = () => {
-            for (const o of [...editor.objects]) if (o.entity.assetId === a.id) editor._detach(o);
+            for (const o of [...editor.objects]) if (o.entity.assetId === a.id && editor.inScene(o)) editor._detach(o);
             editor.assets.remove(a.id);
             editor.history.clear();
             editor.emit('sceneChanged');
             toast(`Removed ${a.name}`);
           };
           if (!n) return doIt();
-          modal('Remove model?', h('p', {}, `"${a.name}" is placed ${n} time(s). Removing it deletes those objects and clears undo history.`), {
+          modal('Remove model?', h('p', {}, `"${a.name}" is placed ${n} time(s). Removing it deletes those objects (and their children) and clears undo history.`), {
             actions: [{ label: 'Cancel', run: () => {} }, { label: 'Remove', cls: 'btn-danger', run: doIt }],
           });
         }, { cls: 'btn-ghost btn-sm', title: 'Remove from library' }),
@@ -211,47 +286,112 @@ export function assetsPanel(root, editor, { importGLB }) {
 
 // ====================================================================== Outliner
 
+const boneLabel = (bone) => bone.replace(/^(Left|Right)Hand_Socket$/, (_, side) => `${side[0]} hand`);
+
+/** The scene tree. Drag rows onto each other to parent them (onto "Map & Terrain" for the top level). */
 export function outliner(root, editor) {
-  let filter = '';
+  let filter = '', dragging = null;
+  const collapsed = new WeakSet();
   const list = h('div', { class: 'outliner-list' });
   root.append(
     h('div', { class: 'outliner-head' },
       textInput({ value: '', placeholder: 'Filter objects…', onInput: (v) => { filter = v.toLowerCase(); render(); } })),
     list,
   );
+
+  const canDrop = (target) => dragging && !dragging.some((d) => target && isWithin(target, d));
+  const clearDrop = () => list.querySelectorAll('.drop-into').forEach((r) => r.classList.remove('drop-into'));
+  const dropTarget = (el, target) => {
+    el.addEventListener('dragover', (e) => {
+      if (!canDrop(target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = 'move';
+      clearDrop();
+      el.classList.add('drop-into');
+    });
+    el.addEventListener('drop', (e) => {
+      if (!canDrop(target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const objs = dragging;
+      dragging = null;
+      clearDrop();
+      if (target) collapsed.delete(target);
+      editor.setParent(objs, target);
+    });
+  };
+  dropTarget(list, null);
+  list.addEventListener('dragleave', (e) => { if (!list.contains(e.relatedTarget)) clearDrop(); });
+
   const render = () => {
     const sel = editor.selected;
-    const visible = () => editor.objects.filter((o) => !filter || o.name.toLowerCase().includes(filter) || o.entity.props.tags.toLowerCase().includes(filter));
+    const match = (o) => !filter || o.name.toLowerCase().includes(filter) || o.entity.props.tags.toLowerCase().includes(filter);
+    // Depth-first rows. With a filter, an object shows if it or anything below it matches.
+    const rows = [];
+    const walk = (o, depth) => {
+      const kids = childEntities(o), at = rows.length;
+      rows.push({ o, depth, kids: kids.length });
+      let shown = match(o);
+      if (filter || !collapsed.has(o)) for (const k of kids) shown = walk(k, depth + 1) || shown;
+      if (!shown) rows.length = at;
+      return shown;
+    };
+    editor.roots.forEach((o) => walk(o, 0));
+    const order = rows.map((r) => r.o);
     const click = (e, o) => {
       if (editor.mode !== 'select') editor.setMode('select');
       if (e.ctrlKey || e.metaKey) editor.toggleSelect(o);
       else if (e.shiftKey && sel) {
         // Range from the primary selection to the clicked row (in list order).
-        const rows = visible(), a = rows.indexOf(sel), b = rows.indexOf(o);
-        const range = a < 0 ? [o] : rows.slice(Math.min(a, b), Math.max(a, b) + 1);
+        const a = order.indexOf(sel), b = order.indexOf(o);
+        const range = a < 0 ? [o] : order.slice(Math.min(a, b), Math.max(a, b) + 1);
         editor.setSelection([...editor.selection.filter((x) => !range.includes(x)), ...range.filter((x) => x !== o), o]);
       } else editor.select(o);
     };
-    const objs = visible();
-    list.replaceChildren(
-      h('div', { class: `ol-row ol-terrain${!sel ? ' selected' : ''}`, onclick: () => editor.select(null), title: 'Map settings' },
-        h('span', { class: 'ol-icon' }, '⛰'), h('span', { class: 'ol-name' }, 'Map & Terrain')),
-      ...objs.map((o) => {
-        const r = h('div', {
-          class: `ol-row${editor.isSelected(o) ? ' selected' : ''}${o.visible ? '' : ' hidden'}`,
-          onclick: (e) => click(e, o),
-          ondblclick: () => editor.focus(o),
+    const terrain = h('div', { class: `ol-row ol-terrain${!sel ? ' selected' : ''}`, onclick: () => editor.select(null), title: 'Map settings · drop objects here to move them to the top level' },
+      h('span', { class: 'ol-icon' }, '⛰'), h('span', { class: 'ol-name' }, 'Map & Terrain'));
+    dropTarget(terrain, null);
+    list.replaceChildren(terrain, ...rows.map(({ o, depth, kids }) => {
+      const open = filter || !collapsed.has(o);
+      const r = h('div', {
+        class: `ol-row${editor.isSelected(o) ? ' selected' : ''}${o.visible ? '' : ' hidden'}`,
+        style: `padding-left: ${4 + depth * 14}px`,
+        draggable: true,
+        onclick: (e) => click(e, o),
+        ondblclick: () => editor.focus(o),
+        ondragstart: (e) => {
+          dragging = editor.isSelected(o) ? editor.topmost(editor.selection) : [o];
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('application/x-3dmap-objects', dragging.map((d) => d.name).join(', '));
         },
-        h('span', { class: 'ol-icon' }, entityIcon(o)),
-        h('span', { class: 'ol-name' }, o.name),
-        h('button', { class: 'ol-eye', title: o.visible ? 'Hide' : 'Show', onclick: (e) => { e.stopPropagation(); editor.setVisible(o, !o.visible); render(); } }, o.visible ? '👁' : '—'));
-        if (o === sel) queueMicrotask(() => r.scrollIntoView({ block: 'nearest' }));
-        return r;
-      }),
-    );
+        ondragend: () => { dragging = null; clearDrop(); },
+      },
+      h('span', {
+        class: `ol-twist${kids ? '' : ' empty'}`,
+        title: kids ? (open ? 'Collapse' : 'Expand') : '',
+        onclick: (e) => {
+          if (!kids || filter) return;
+          e.stopPropagation();
+          if (collapsed.has(o)) collapsed.delete(o); else collapsed.add(o);
+          render();
+        },
+      }, kids ? (open ? '▾' : '▸') : ''),
+      h('span', { class: 'ol-icon' }, entityIcon(o)),
+      h('span', { class: 'ol-name' }, o.name),
+      o.entity.attach ? h('span', { class: 'ol-bone', title: `Attached to ${o.entity.attach}` }, boneLabel(o.entity.attach)) : null,
+      h('button', { class: 'ol-eye', title: o.visible ? 'Hide' : 'Show', onclick: (e) => { e.stopPropagation(); editor.setVisible(o, !o.visible); render(); } }, o.visible ? '👁' : '—'));
+      dropTarget(r, o);
+      if (o === sel) queueMicrotask(() => r.scrollIntoView({ block: 'nearest' }));
+      return r;
+    }));
   };
   editor.on('sceneChanged', render);
-  editor.on('selectionChanged', render);
+  editor.on('selectionChanged', () => {
+    // reveal the selection inside collapsed parents
+    for (const o of editor.selection) for (let p = parentEntity(o); p; p = parentEntity(p)) collapsed.delete(p);
+    render();
+  });
   editor.on('objectChanged', render);
   render();
 }

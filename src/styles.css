@@ -201,3 +201,17 @@ table.keys td:first-child { white-space: nowrap; }
   #app { grid-template-columns: 240px 1fr 260px; }
   .brand span { display: none; }
 }
+
+/* ---------- scene tree & tinyimgen ---------- */
+.ol-twist { width: 12px; flex: none; text-align: center; color: var(--muted); font-size: 10px; }
+.ol-twist:not(.empty):hover { color: var(--text); }
+.ol-bone { font-size: 10px; color: var(--muted); background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 0 5px; white-space: nowrap; }
+.ol-row.drop-into { outline: 1px dashed var(--accent); outline-offset: -1px; background: #213555; }
+.tiny-body { display: flex; flex-direction: column; gap: 6px; }
+.tiny-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 6px; }
+.tiny-card { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 5px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); color: var(--text); font: inherit; cursor: pointer; min-width: 0; }
+.tiny-card:hover { border-color: #48505e; }
+.tiny-card.busy { opacity: 0.6; cursor: progress; }
+.tiny-card img, .tiny-card .thumb-ph { width: 100%; height: auto; aspect-ratio: 1; object-fit: contain; border-radius: 4px; background: #11141a; }
+.tiny-name { font-size: 11px; line-height: 1.25; width: 100%; text-align: center; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.tiny-card small { color: var(--muted); font-size: 10px; text-align: center; }

@@ -7,7 +7,22 @@ import * as THREE from 'three';
 export const MARKERS = {
   spawn: {
     label: 'Player Spawn', icon: '⚑', color: '#3ddc84',
-    params: [{ key: 'team', label: 'Team / ID', type: 'text', default: 'player' }],
+    // The player settings are read by the playtest (src/game/main.js) and exported in userData.params for your game.
+    params: [
+      { key: 'team', label: 'Team / ID', type: 'text', default: 'player' },
+      { section: 'Camera', key: 'view', label: 'Start in', type: 'select', default: '', options: [['', "Player's choice"], ['first', 'First person'], ['third', 'Third person']] },
+      { section: 'Camera', key: 'facing', label: 'Facing', type: 'select', default: '', options: [['', "Player's choice"], ['free', 'Turns to move'], ['strafe', 'Strafe (faces camera)']] },
+      { section: 'Camera', key: 'cameraDistance', label: '3rd-person distance', default: 4.5, min: 1.2, max: 14, step: 0.1 },
+      { section: 'Camera', key: 'eyeHeight', label: 'Eye height', default: 1.6, min: 0.2, max: 10, step: 0.05 },
+      { section: 'Movement', key: 'walkSpeed', label: 'Walk speed', default: 6, min: 0.1, max: 100, step: 0.1, title: 'm/s in first person. In third person the character moves at its animation speed.' },
+      { section: 'Movement', key: 'runSpeed', label: 'Run speed', default: 11, min: 0.1, max: 100, step: 0.1, title: 'm/s in first person (Shift)' },
+      { section: 'Movement', key: 'jump', label: 'Jump speed', default: 8, min: 0, max: 100, step: 0.1, title: 'Upward speed when jumping (m/s). Jump height ≈ speed² / (2 × gravity).' },
+      { section: 'Movement', key: 'gravity', label: 'Gravity', default: 24, min: 0.1, max: 200, step: 0.5, title: 'm/s²' },
+      { section: 'Movement', key: 'stepHeight', label: 'Step height', default: 0.45, min: 0, max: 5, step: 0.05, title: 'Tallest ledge walked up without jumping (m)' },
+      { section: 'Movement', key: 'maxSlope', label: 'Max slope°', default: 50, min: 1, max: 89, step: 1, title: 'Steeper surfaces can\'t be climbed; the player slides off them' },
+      { section: 'Movement', key: 'radius', label: 'Radius', default: 0.35, min: 0.05, max: 5, step: 0.05, title: 'Collision radius (m)' },
+      { section: 'Movement', key: 'height', label: 'Body height', default: 1.8, min: 0.2, max: 20, step: 0.05, title: 'Collision height (m): the player can walk under things taller than this' },
+    ],
   },
   waypoint: {
     label: 'Waypoint', icon: '◆', color: '#ffcc33',

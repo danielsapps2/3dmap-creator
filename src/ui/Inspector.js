@@ -1,8 +1,14 @@
 import * as THREE from 'three';
-import { h, row, section, numberInput, slider, vec3Input, colorInput, checkbox, select, textInput, button } from './dom.js';
+import { h, row, section, numberInput, slider, vec3Input, colorInput, checkbox, select, textInput, button, toast } from './dom.js';
 import { PRIMITIVES } from '../editor/Primitives.js';
 import { MARKERS } from '../editor/Markers.js';
-import { serializeEntity, refreshEntity, entityLabel, entityIcon, COLLIDERS } from '../editor/Entities.js';
+import {
+  serializeEntity, refreshEntity, entityLabel, entityIcon, COLLIDERS, parentEntity, childEntities, entitySubtree,
+} from '../editor/Entities.js';
+import { entityRig, entityProp, isHandSocket, socketForHand, holdData } from '../editor/Rig.js';
+import { FINGERS, curlValue } from '../runtime/props.js';
+import { DEFAULT_FINGERS } from '../runtime/hold.js';
+import { tinyimgenCatalog, importTinyimgen } from '../editor/Tinyimgen.js';
 
 const DEG = THREE.MathUtils.RAD2DEG, RAD = THREE.MathUtils.DEG2RAD;
 
@@ -17,7 +23,8 @@ export class Inspector {
     editor.on('objectChanged', (obj) => { if (editor.isSelected(obj) && !this._selfCommit) this._renderSoon(); });
     editor.on('objectTransformed', (obj) => { if (obj === editor.selected) this.syncTransform(); });
     editor.on('envChanged', () => { if (!editor.selected) this.render(); });
-    editor.on('sceneChanged', () => { if (!editor.selected) this.render(); });
+    // children added or removed (e.g. the spawn's player model) change what the selection's sections show
+    editor.on('sceneChanged', () => { if (!this._selfCommit) this._renderSoon(); });
     editor.on('terrainChanged', () => { if (!editor.selected) this.render(); });
     this.render();
   }
@@ -107,9 +114,13 @@ export class Inspector {
 
   /** Apply a mutation to the selected entity; commit=true records one undo step. */
   edit(obj, mutate, commit, { refresh = true } = {}) {
-    if (!this._before) this._before = serializeEntity(obj);
+    if (!this._before || this._beforeObj !== obj) {
+      this._before = serializeEntity(obj);
+      this._beforeObj = obj;
+    }
     mutate(obj.entity);
     if (refresh) refreshEntity(obj);
+    this.editor.requestPose();
     if (commit) {
       const before = this._before;
       this._before = null;
@@ -149,6 +160,8 @@ export class Inspector {
         h('small', {}, entityLabel(obj), e.kind === 'asset' ? ` · ${ed.assets.get(e.assetId)?.fileName ?? ''}` : '')),
     ));
 
+    this.root.append(this._hierarchySection(obj));
+
     // Transform
     const f = this.fields;
     const tf = (fn) => bind((_, v) => fn(v), { refresh: false });
@@ -167,18 +180,20 @@ export class Inspector {
       row('Scale', f.scale),
       row('Uniform', f.uniform),
     ];
-    if (e.kind === 'asset') {
+    if (e.kind === 'asset' && !e.attach) {
       const asset = ed.assets.get(e.assetId);
       const [hIn, hCh] = tf((v) => { if (asset?.size.y > 0) obj.scale.setScalar(v / asset.size.y); });
       f.height = numberInput({ value: this._assetHeight(obj), step: 0.1, min: 0.001, onInput: afterUniform(hIn), onChange: afterUniform(hCh), title: 'Scale uniformly so the model is this tall' });
       transformRows.push(row('Height (m)', f.height));
     }
     transformRows.push(h('div', { class: 'btn-row' },
-      button('Drop to ground', () => ed.dropToGround(obj), { title: 'G' }),
-      button('Snap to grid', () => ed.snapToGrid(obj), { title: 'Round position X/Z, rotation and scale to the snap steps (Shift+S)' }),
+      e.attach ? null : button('Drop to ground', () => ed.dropToGround(obj), { title: 'G' }),
+      e.attach ? null : button('Snap to grid', () => ed.snapToGrid(obj), { title: 'Round position X/Z, rotation and scale to the snap steps (Shift+S)' }),
       button('Reset rot', () => this.edit(obj, () => obj.rotation.set(0, 0, 0), true, { refresh: false })),
       button('Focus', () => ed.focus(obj), { title: 'F' }),
     ));
+    const parent = parentEntity(obj);
+    if (parent) transformRows.unshift(h('p', { class: 'hint' }, `Relative to ${e.attach ? `${parent.name} → ${e.attach}` : parent.name}.`));
     this.root.append(section('Transform', transformRows));
 
     // Shape / marker / asset params
@@ -186,7 +201,20 @@ export class Inspector {
       this.root.append(section('Shape', PRIMITIVES[e.type].params.map((p) => this._paramRow(obj, p))));
       this.root.append(this._materialSection(obj));
     } else if (e.kind === 'marker') {
-      this.root.append(section(MARKERS[e.type].label, MARKERS[e.type].params.map((p) => this._paramRow(obj, p))));
+      // params without a `section` go under the marker's name; the rest get a section each (the spawn's player settings)
+      const groups = new Map([[MARKERS[e.type].label, []]]);
+      for (const p of MARKERS[e.type].params) {
+        const key = p.section ?? MARKERS[e.type].label;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(this._paramRow(obj, p));
+      }
+      if (e.type === 'spawn') {
+        groups.get('Movement')?.push(h('p', { class: 'hint' }, 'Used by ▶ Play and exported in this node\'s userData.params. Walk and run speeds apply in first person; in third person the character moves at its animation\'s speed.'));
+      }
+      for (const [title, rows] of groups) {
+        this.root.append(section(title, rows, { open: title !== 'Movement' }));
+        if (e.type === 'spawn' && title === MARKERS.spawn.label) this._playerSection(obj).forEach((el) => this.root.append(el));
+      }
     } else if (e.kind === 'asset') {
       const asset = ed.assets.get(e.assetId);
       const [, cpCh] = bind((en, v) => { en.params.centerPivot = v; });
@@ -194,11 +222,16 @@ export class Inspector {
         row('Source size', h('span', { class: 'muted' }, asset ? asset.size.toArray().map((n) => n.toFixed(2)).join(' × ') : '?')),
         row('Base pivot', checkbox({ value: e.params.centerPivot, onChange: cpCh, label: 'Center on base' })),
         asset?.animations.length ? row('Animations', h('span', { class: 'muted' }, asset.animations.map((a) => a.name || 'clip').join(', '))) : null,
+        asset?.rig ? row('Rig', h('span', { class: 'muted' }, `${asset.rig.bones.length} bones${asset.rig.sockets.length ? ` · ${asset.rig.sockets.join(', ')}` : ''}`)) : null,
+        asset?.prop ? row('Holdable', h('span', { class: 'muted' }, `${asset.prop.hands === 2 ? 'two hands' : 'one hand'} · ${asset.prop.hold}${asset.prop.grip ? '' : ' · no grip.json (default finger curl)'}`)) : null,
+        asset?.meta.tinyimgen ? row('Source', h('span', { class: 'muted' }, `tinyimgen ${asset.meta.tinyimgen.role} ${asset.meta.tinyimgen.id}`)) : null,
       ]));
+      if (asset?.rig?.sockets.some(isHandSocket)) this.root.append(this._handsSection(obj));
+      if (asset?.prop && isHandSocket(e.attach)) this.root.append(this._holdSection(obj));
     }
 
     // Rendering
-    if (e.kind !== 'marker') {
+    if (e.kind !== 'marker' && e.kind !== 'group') {
       const [, castCh] = bind((en, v) => { en.shadow.cast = v; });
       const [, recvCh] = bind((en, v) => { en.shadow.receive = v; });
       this.root.append(section('Rendering', [
@@ -214,15 +247,200 @@ export class Inspector {
     ));
   }
 
+  /** Parent, bone attachment and children. */
+  _hierarchySection(obj) {
+    const ed = this.editor, e = obj.entity, parent = parentEntity(obj);
+    const mine = new Set(entitySubtree(obj));
+    const depth = (o) => { let d = 0; for (let p = parentEntity(o); p; p = parentEntity(p)) d++; return d; };
+    const candidates = ed.objects.filter((o) => !mine.has(o));
+    const rows = [
+      row('Parent', select({
+        value: parent?.entity.id ?? '',
+        options: [['', '— none (top level) —'], ...candidates.map((o) => [o.entity.id, `${'\u00a0\u00a0'.repeat(depth(o))}${entityIcon(o)} ${o.name}`])],
+        onChange: (id) => ed.setParent([obj], candidates.find((o) => o.entity.id === id) ?? null),
+      })),
+    ];
+    const rig = entityRig(parent, ed.assets);
+    if (rig) {
+      rows.push(row('Attach to', select({
+        value: e.attach ?? '',
+        options: [['', `${parent.name} (no bone)`], ...rig.attachPoints.map((b) => [b, b])],
+        onChange: (bone) => ed.attachTo(obj, bone || null, { snap: !!entityProp(obj, ed.assets) && isHandSocket(bone) }),
+      })));
+    }
+    const kids = childEntities(obj);
+    if (kids.length) {
+      rows.push(row('Children', h('span', { class: 'muted' }, kids.map((k) => k.name).join(', ')),
+        button('Select', () => ed.setSelection(kids), { cls: 'btn-sm' })));
+    }
+    rows.push(h('p', { class: 'hint' }, 'Or drag it onto another object in the Scene list. Children move, hide and export with their parent.'));
+    return section('Hierarchy', rows, { open: !!parent || kids.length > 0 });
+  }
+
+  /** What a character holds, and a picker to hand it a prop (library props and tinyimgen's). */
+  _handsSection(obj, { keepSelection = false } = {}) {
+    const ed = this.editor;
+    const held = childEntities(obj).filter((c) => isHandSocket(c.entity.attach));
+    const pick = { value: '', hand: ed.freeHand(obj, 'Right') };
+    const options = [['', 'Choose a prop…']];
+    const items = new Map();
+    for (const a of ed.assets.list()) if (a.prop) { options.push([`lib:${a.id}`, a.name]); items.set(`lib:${a.id}`, a); }
+    const picker = select({ value: '', options, onChange: (v) => { pick.value = v; } });
+    // tinyimgen props that aren't in the library yet (filled in when the catalog arrives)
+    tinyimgenCatalog().then(({ props }) => {
+      for (const p of props) {
+        if (ed.assets.findTinyimgen(p.id, 'prop')) continue;
+        items.set(`tiny:${p.id}`, p);
+        picker.append(h('option', { value: `tiny:${p.id}` }, `${p.name} (tinyimgen)`));
+      }
+    }).catch(() => {});
+    const give = async (hand) => {
+      const item = items.get(pick.value);
+      if (!item) { toast('Choose a prop first'); return; }
+      try {
+        const asset = item.role === 'prop' ? await importTinyimgen(ed, item) : item;
+        ed.holdProp(obj, asset.id, hand, { select: !keepSelection });
+      } catch (err) {
+        toast(`Couldn't import ${item.name}: ${err.message}`, { type: 'error', timeout: 6000 });
+      }
+    };
+    return section('Hands', [
+      ...held.map((c) => row(c.entity.attach.startsWith('Left') ? 'Left hand' : 'Right hand',
+        h('span', { class: 'muted' }, c.name),
+        button('Select', () => ed.select(c), { cls: 'btn-sm' }),
+        button('✕', () => ed.removeObject(c), { cls: 'btn-ghost btn-sm', title: 'Drop it (delete)' }))),
+      row('Hold', picker),
+      h('div', { class: 'btn-row' },
+        button('In right hand', () => give('Right'), { cls: 'btn-sm' }),
+        button('In left hand', () => give('Left'), { cls: 'btn-sm' })),
+      h('p', { class: 'hint' }, 'The prop\'s grip goes on the hand socket, with the finger curls and hold saved in tinyimgen\'s Prop Editor. The editor shows the first frame of Idle; the playtest animates it.'),
+    ]);
+  }
+
+  /**
+   * The player under a Player Spawn: its rigged model (pick, replace, height), what it holds, and how each prop is
+   * held. Returns the sections to add.
+   */
+  _playerSection(spawn) {
+    const ed = this.editor, model = ed.playerModel(spawn);
+    const items = new Map(), options = [['', model ? 'Replace with…' : 'Choose a human model…']];
+    for (const a of ed.assets.list()) if (a.rig) { options.push([`lib:${a.id}`, a.name]); items.set(`lib:${a.id}`, a); }
+    const picker = select({
+      value: '', options,
+      onChange: async (v) => {
+        const item = items.get(v);
+        if (!item) return;
+        try {
+          const asset = item.role === 'character' ? await importTinyimgen(ed, item) : item;
+          ed.setPlayerModel(spawn, asset.id);
+        } catch (err) {
+          toast(`Couldn't import ${item.name}: ${err.message}`, { type: 'error', timeout: 6000 });
+        }
+      },
+    });
+    tinyimgenCatalog().then(({ characters }) => {
+      for (const c of characters) {
+        if (ed.assets.findTinyimgen(c.id, 'character')) continue;
+        items.set(`tiny:${c.id}`, c);
+        picker.append(h('option', { value: `tiny:${c.id}` }, `${c.name} (tinyimgen)`));
+      }
+    }).catch(() => {});
+
+    const rows = [];
+    if (model) {
+      const asset = ed.assets.get(model.entity.assetId);
+      const height = () => asset.size.y * model.scale.y;
+      const hIn = numberInput({
+        value: height(), step: 0.05, min: 0.1, title: 'Scales the model uniformly to this height; the playtest uses it too',
+        onInput: (v) => this.edit(model, () => model.scale.setScalar(v / asset.size.y), false, { refresh: false }),
+        onChange: (v) => this.edit(model, () => model.scale.setScalar(v / asset.size.y), true, { refresh: false }),
+      });
+      rows.push(
+        row('Model', h('span', { class: 'muted' }, model.name),
+          button('Select', () => ed.select(model), { cls: 'btn-sm' }),
+          button('✕', () => ed.removeObject(model), { cls: 'btn-ghost btn-sm', title: 'Remove the model (and what it holds)' })),
+        row('Height (m)', hIn),
+      );
+    }
+    rows.push(row(model ? 'Replace' : 'Model', picker));
+    rows.push(h('p', { class: 'hint' }, model
+      ? '▶ Play uses this model as the player, animated with tinyimgen\'s locomotion, holding its props.'
+      : 'Pick a rigged human (from the library or tinyimgen). ▶ Play then uses it as the player.'));
+    const out = [section('Player', rows)];
+    if (model && entityRig(model, ed.assets).sockets.some(isHandSocket)) {
+      out.push(this._handsSection(model, { keepSelection: true }));
+      for (const prop of childEntities(model)) {
+        if (entityProp(prop, ed.assets) && isHandSocket(prop.entity.attach)) out.push(this._holdSection(prop, { title: `Hold · ${prop.name}`, open: false }));
+      }
+    }
+    return out;
+  }
+
+  /** How a held prop is held: hand, hold style, arms, finger curls, grip offset. Edits go on top of its grip.json. */
+  _holdSection(prop, { title = 'Hold', open = true } = {}) {
+    const ed = this.editor, e = prop.entity, data = holdData(prop, ed.assets);
+    const hand = e.attach.startsWith('Left') ? 'Left' : 'Right', other = hand === 'Left' ? 'Right' : 'Left';
+    const setHold = (patch, commit) => this.edit(prop, (en) => { en.params.hold = { ...en.params.hold, ...patch }; }, commit, { refresh: false });
+    const fingersOf = (which) => ({ ...(holdData(prop, ed.assets).fingers?.[which] ?? DEFAULT_FINGERS) });
+    const setFingers = (which, curls, commit) => this.edit(prop, (en) => {
+      const prev = en.params.hold ?? {};
+      en.params.hold = { ...prev, fingers: { ...prev.fingers, [which]: curls } };
+    }, commit, { refresh: false });
+    const fingerRows = (which, label) => {
+      const sliders = FINGERS.map((f) => {
+        const s = slider({
+          value: curlValue(fingersOf(which)[f] ?? 0), min: 0, max: 1, step: 0.01,
+          onInput: (v) => setFingers(which, { ...fingersOf(which), [f]: v }, false),
+          onChange: (v) => setFingers(which, { ...fingersOf(which), [f]: v }, true),
+        });
+        return row(f, s);
+      });
+      const preset = (name, v) => button(name, () => { setFingers(which, Object.fromEntries(FINGERS.map((f) => [f, f === 'Thumb' ? [0.15, v, v] : v])), true); this.render(); }, { cls: 'btn-sm' });
+      return [h('div', { class: 'row-label sub' }, label), ...sliders,
+        h('div', { class: 'btn-row' }, preset('Open', 0), preset('Relaxed', 0.45), preset('Fist', 1))];
+    };
+    const [pIn, pCh] = [false, true].map((commit) => (v) => this.edit(prop, () => prop.position.fromArray(v), commit, { refresh: false }));
+    const [rIn, rCh] = [false, true].map((commit) => (v) => this.edit(prop, () => prop.rotation.set(v[0] * RAD, v[1] * RAD, v[2] * RAD), commit, { refresh: false }));
+    const edited = !!e.params.hold && Object.keys(e.params.hold).length > 0;
+    return section(title, [
+      row('Hand', select({
+        value: hand, options: [['Right', 'Right hand'], ['Left', 'Left hand']],
+        onChange: (v) => { if (v !== hand) ed.attachTo(prop, socketForHand(v), { snap: true }); },
+      })),
+      row('Hold', select({
+        value: data.hold ?? 'upright', options: [['upright', 'Upright (swords, tools)'], ['forward', 'Forward (guns, wands)']],
+        onChange: (v) => setHold({ hold: v }, true),
+      })),
+      data.hands === 2 ? h('p', { class: 'hint' }, `Two-handed: carried in front, the ${other.toLowerCase()} hand on the second grip.`) : null,
+      data.carry ? row('Arms', select({
+        value: data.arms, options: [['animated', 'Animated (swing with the clip)'], ['static', 'Static (saved carry pose)']],
+        onChange: (v) => setHold({ arms: v }, true),
+      })) : null,
+      ...fingerRows('primary', `${hand} hand fingers (0 open … 1 fist)`),
+      ...(data.hands === 2 ? fingerRows('secondary', `${other} hand fingers`) : []),
+      h('div', { class: 'row-label sub' }, 'Grip offset (relative to the hand socket)'),
+      row('Position', vec3Input({ value: prop.position.toArray(), step: 0.005, onInput: pIn, onChange: pCh })),
+      row('Rotation°', vec3Input({ value: [prop.rotation.x * DEG, prop.rotation.y * DEG, prop.rotation.z * DEG], step: 1, onInput: rIn, onChange: rCh })),
+      h('div', { class: 'btn-row' },
+        button('Snap grip to hand', () => ed.snapToGrip(prop), { title: 'Put the grip (from tinyimgen\'s Prop Editor) back on the hand socket' }),
+        button('Reset to saved grip', () => { this.edit(prop, (en) => { delete en.params.hold; }, true, { refresh: false }); this.render(); },
+          { title: edited ? 'Drop the edits above and use the prop\'s grip.json again' : 'No edits yet' })),
+      h('p', { class: 'hint' }, edited ? 'Edited here: these settings override the prop\'s tinyimgen grip for this copy.' : 'From the prop\'s tinyimgen grip.json. Changes here apply to this copy only.'),
+    ], { open });
+  }
+
   _paramRow(obj, p) {
     const e = obj.entity;
     const set = (commit) => (v) => this.edit(obj, (en) => { en.params[p.key] = v; }, commit);
     let control;
-    if (p.type === 'text') control = textInput({ value: e.params[p.key], onInput: set(false), onChange: set(true) });
+    if (p.type === 'select') control = select({ value: e.params[p.key], options: p.options, onChange: set(true) });
+    else if (p.type === 'text') control = textInput({ value: e.params[p.key], onInput: set(false), onChange: set(true) });
     else if (p.type === 'color') control = colorInput({ value: e.params[p.key], onInput: set(false), onChange: set(true) });
     else if (p.type === 'bool') control = checkbox({ value: e.params[p.key], onChange: set(true) });
-    else control = numberInput({ value: e.params[p.key], step: p.step, min: p.min, max: p.max, int: p.int, onInput: set(false), onChange: set(true) });
-    return row(p.label, control);
+    else control = numberInput({ value: e.params[p.key], step: p.step, min: p.min, max: p.max, int: p.int, onInput: set(false), onChange: set(true), title: p.title });
+    const r = row(p.label, control);
+    if (p.title) r.title = p.title;
+    return r;
   }
 
   _materialSection(obj) {
@@ -298,11 +516,11 @@ export class Inspector {
     this.root.append(section('Editor', [
       row('Grid', checkbox({ value: env.showGrid, onChange: set('showGrid'), label: 'Show grid' })),
     ]));
-    const counts = { primitive: 0, asset: 0, marker: 0 };
+    const counts = { primitive: 0, asset: 0, marker: 0, group: 0 };
     ed.objects.forEach((o) => counts[o.entity.kind]++);
     const t = ed.terrain;
     this.root.append(section('Stats', [
-      row('Objects', h('span', { class: 'muted' }, `${counts.primitive} primitives · ${counts.asset} models · ${counts.marker} markers`)),
+      row('Objects', h('span', { class: 'muted' }, `${counts.primitive} primitives · ${counts.asset} models · ${counts.marker} markers${counts.group ? ` · ${counts.group} empties` : ''}`)),
       row('Terrain', h('span', { class: 'muted' }, `${t.size}×${t.size} m · ${t.segments}² cells`)),
       row('Assets', h('span', { class: 'muted' }, `${ed.assets.list().length} GLB files`)),
     ]));

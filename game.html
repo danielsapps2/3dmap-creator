@@ -6,6 +6,7 @@
     <title>Map Playtest</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>▶</text></svg>" />
     <style>
+      [hidden] { display: none !important; }
       html, body { margin: 0; height: 100%; overflow: hidden; background: #111; color: #e8ecf2; font: 14px/1.45 system-ui, sans-serif; }
       canvas { display: block; }
       #hud { position: fixed; top: 10px; left: 10px; background: #000a; padding: 8px 12px; border-radius: 8px; font-size: 12px; pointer-events: none; }
@@ -22,17 +23,32 @@
       #event { position: fixed; top: 22%; left: 50%; transform: translateX(-50%); background: #000b; padding: 8px 16px; border-radius: 20px; display: none; }
       #crosshair { position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px; border-radius: 50%; background: #fff9; pointer-events: none; }
       #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: #000a; }
-      .card { background: #1c2027; border: 1px solid #2f3540; border-radius: 12px; padding: 24px 28px; max-width: 440px; text-align: center; }
+      .card { background: #1c2027; border: 1px solid #2f3540; border-radius: 12px; padding: 24px 28px; width: min(480px, calc(100vw - 32px)); box-sizing: border-box; max-height: calc(100vh - 32px); overflow: auto; text-align: center; }
       .card h1 { margin: 0 0 6px; font-size: 20px; }
       .card p { color: #9aa3b0; margin: 6px 0 16px; }
       button, label.btn { font: inherit; background: #2f6fd1; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px; cursor: pointer; display: inline-block; margin: 4px; }
       button.secondary, label.btn { background: #2a303a; }
       a { color: #7fb0ff; }
       kbd { background: #2a303a; border-radius: 4px; padding: 0 5px; }
+      .setup { margin: 18px 0 4px; padding-top: 16px; border-top: 1px solid #2f3540; text-align: left; }
+      .setup h2 { font-size: 13px; font-weight: 600; margin: 0 0 8px; color: #c9d1dc; }
+      .seg { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+      .seg button { margin: 0; background: #2a303a; flex: 1; }
+      .seg button.active { background: #2f6fd1; }
+      #facing { margin: 0 0 12px; width: 100%; background: #2a303a; font-size: 13px; }
+      .chars { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; }
+      .char-tile { margin: 0; padding: 6px; background: #232830; border: 2px solid transparent; border-radius: 8px; display: flex; flex-direction: column; align-items: center; gap: 4px; color: #e8ecf2; }
+      .char-tile:hover { border-color: #3d4654; }
+      .char-tile.selected { border-color: #2f6fd1; background: #1f2b3d; }
+      .char-tile img, .char-icon { width: 100%; aspect-ratio: 1; object-fit: contain; border-radius: 6px; background: #14171c; }
+      .char-icon { display: flex; align-items: center; justify-content: center; font-size: 30px; color: #7fb0ff; }
+      .char-name { font-size: 11px; line-height: 1.25; width: 100%; text-align: center; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+      .small { font-size: 12px; color: #9aa3b0; margin: 8px 0 0; }
+      .small.error { color: #ff8a8a; }
     </style>
   </head>
   <body>
-    <div id="hud"><b id="map-name">No map loaded</b><br /><kbd>WASD</kbd> move · <kbd>Shift</kbd> run · <kbd>Space</kbd> jump · <kbd>R</kbd> respawn · <kbd>F3</kbd> stats · <kbd>Esc</kbd> release mouse<br /><span id="pos"></span></div>
+    <div id="hud"><b id="map-name">No map loaded</b><br /><kbd>WASD</kbd> move · <kbd>Shift</kbd> run · <kbd>Space</kbd> jump · <kbd>R</kbd> respawn · <kbd>V</kbd> 1st/3rd person · <kbd>T</kbd> facing · <kbd>F3</kbd> stats · <kbd>Esc</kbd> release mouse<br /><span id="hud-view"></span> · <span id="pos"></span></div>
     <div id="crosshair"></div>
     <div id="event"></div>
     <div id="overlay">
@@ -41,6 +57,16 @@
         <p id="subtitle">Load a .glb exported from 3D Map Creator, or press ▶ Play in the editor.</p>
         <button id="play" hidden>Click to play</button>
         <label class="btn">Load .glb…<input id="file" type="file" accept=".glb,.gltf" hidden /></label>
+        <div class="setup">
+          <h2>Camera</h2>
+          <div class="seg"><button id="view-first">First person</button><button id="view-third">Third person</button></div>
+          <button id="facing" hidden></button>
+          <h2>Character</h2>
+          <div id="chars" class="chars"></div>
+          <p id="char-msg" class="small"></p>
+          <p id="chars-note" class="small"></p>
+          <input id="char-file" type="file" accept=".glb,.gltf" hidden />
+        </div>
         <p style="margin:14px 0 0"><a href="./index.html">← Back to editor</a></p>
       </div>
     </div>

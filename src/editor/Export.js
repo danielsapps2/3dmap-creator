@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { clone as skeletonClone } from 'three/addons/utils/SkeletonUtils.js';
-import { customPropsToObject, isEditorOnly } from './Entities.js';
+import { customPropsToObject, isEditorOnly, childEntities, parentEntity } from './Entities.js';
+import { holdData } from './Rig.js';
 
 export const MAP_FORMAT = '3dmap-creator';
 
@@ -18,16 +19,37 @@ export function exportUserData(obj, editor) {
     receiveShadow: e.shadow.receive,
     props: customPropsToObject(e.props.custom),
   };
+  const parent = parentEntity(obj);
+  if (parent) ud.parentId = parent.entity.id;
+  if (e.attach) ud.attachedTo = e.attach; // the parent's bone this node is parented to (e.g. "RightHand_Socket")
   if (e.kind === 'primitive') {
     ud.primitive = e.type;
     ud.params = { ...e.params };
   } else if (e.kind === 'asset') {
-    ud.asset = editor.assets.get(e.assetId)?.name ?? e.assetId;
+    const asset = editor.assets.get(e.assetId);
+    ud.asset = asset?.name ?? e.assetId;
+    if (asset?.meta.tinyimgen) ud.tinyimgen = { ...asset.meta.tinyimgen };
+    if (asset?.rig) ud.rig = { sockets: [...asset.rig.sockets] };
+    if (asset?.prop) ud.grip = holdData(obj, editor.assets); // tinyimgen grip.json + this instance's edits
   } else if (e.kind === 'marker') {
     ud.marker = e.type;
     ud.params = { ...e.params };
   }
   return ud;
+}
+
+/** Run fn with obj's child entities taken out of it, so cloning obj copies only its own parts. */
+function withoutChildEntities(obj, fn) {
+  const kids = childEntities(obj).map((k) => ({ k, parent: k.parent, index: k.parent.children.indexOf(k) }));
+  kids.forEach(({ k }) => k.parent.remove(k));
+  try {
+    return fn();
+  } finally {
+    for (const { k, parent, index } of kids.reverse()) {
+      parent.children.splice(index, 0, k);
+      k.parent = parent;
+    }
+  }
 }
 
 function cloneForExport(obj, editor) {
@@ -38,7 +60,9 @@ function cloneForExport(obj, editor) {
       ? new THREE.PointLight(obj.color, obj.intensity, obj.distance, obj.decay)
       : new THREE.Object3D();
   } else if (e.kind === 'asset') {
-    c = skeletonClone(obj);
+    c = withoutChildEntities(obj, () => skeletonClone(obj));
+  } else if (e.kind === 'group') {
+    c = new THREE.Object3D();
   } else {
     c = obj.clone(false);
   }
@@ -50,6 +74,33 @@ function cloneForExport(obj, editor) {
   c.traverse((o) => { if (o !== c && isEditorOnly(o)) strip.push(o); });
   strip.forEach((o) => o.removeFromParent());
   c.userData = exportUserData(obj, editor);
+  return c;
+}
+
+/**
+ * An entity and its visible child entities as nested nodes. A child attached to a bone goes under that bone's
+ * copy, so a held prop follows the hand in any engine that animates the character.
+ */
+function exportTree(obj, editor, includeMarkers) {
+  const kids = childEntities(obj).filter((k) => k.visible);
+  let c;
+  if (!includeMarkers && obj.entity.kind === 'marker') {
+    if (!kids.length) return null;
+    c = new THREE.Object3D(); // keep the marker's children where they are
+    c.name = obj.name;
+    c.position.copy(obj.position);
+    c.quaternion.copy(obj.quaternion);
+    c.scale.copy(obj.scale);
+  } else {
+    c = cloneForExport(obj, editor);
+  }
+  for (const k of kids) {
+    const kc = exportTree(k, editor, includeMarkers);
+    if (!kc) continue;
+    let host = c;
+    if (k.entity.attach) c.traverse((n) => { if (host === c && n.name === k.entity.attach) host = n; });
+    host.add(kc);
+  }
   return c;
 }
 
@@ -73,10 +124,11 @@ export function buildExportScene(editor, { includeTerrain = true, includeMarkers
     };
     root.add(mesh);
   }
-  for (const obj of editor.objects) {
+  editor.updatePoses(); // characters export in the pose the editor shows (idle frame, holding their props)
+  for (const obj of editor.roots) {
     if (!obj.visible) continue;
-    if (!includeMarkers && obj.entity.kind === 'marker') continue;
-    root.add(cloneForExport(obj, editor));
+    const c = exportTree(obj, editor, includeMarkers);
+    if (c) root.add(c);
   }
   return root;
 }
@@ -104,6 +156,8 @@ export function exportLayoutJSON(editor) {
       // Row-major, index = iz * (segments + 1) + ix; x = ix * size / segments - size / 2 (same for z)
       heights: Array.from(t.heights, (h) => Math.round(h * 1000) / 1000),
     },
+    // Parents come before their children; a child's transform is local to its parent (or to the parent's bone
+    // `attachedTo`).
     objects: editor.objects.map((obj) => ({
       name: obj.name,
       visible: obj.visible,

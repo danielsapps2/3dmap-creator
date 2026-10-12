@@ -1,4 +1,4 @@
-import { serializeEntity, deserializeEntity, RAMP_PRIMITIVES } from './Entities.js';
+import { serializeEntity, buildEntities, RAMP_PRIMITIVES } from './Entities.js';
 import { DEFAULT_ENV } from './Editor.js';
 import { arrayBufferToBase64, base64ToArrayBuffer } from '../core/utils.js';
 
@@ -8,13 +8,13 @@ export const PROJECT_FORMAT = '3dmap-creator-project';
 export function serializeProject(editor) {
   return {
     format: PROJECT_FORMAT,
-    version: 2,
+    version: 4,
     name: editor.mapName,
     savedAt: new Date().toISOString(),
     environment: { ...editor.env },
     terrain: editor.terrain.toJSON(),
-    assets: editor.assets.list().map((a) => ({ id: a.id, name: a.fileName, buffer: a.buffer })),
-    objects: editor.objects.map(serializeEntity),
+    assets: editor.assets.list().map((a) => ({ id: a.id, name: a.fileName, buffer: a.buffer, meta: a.meta })),
+    objects: editor.objects.map(serializeEntity), // parents before children; transforms are local to the parent
     camera: { position: editor.camera.position.toArray(), target: editor.orbit.target.toArray() },
     settings: {
       snap: { ...editor.snap },
@@ -36,7 +36,7 @@ export async function loadProject(editor, data, { onWarning = console.warn } = {
 
   for (const a of data.assets ?? []) {
     try {
-      await editor.assets.add(a.name, a.buffer, a.id);
+      await editor.assets.add(a.name, a.buffer, a.id, a.meta);
     } catch (err) {
       onWarning(`Could not load asset "${a.name}": ${err.message}`);
     }
@@ -46,12 +46,17 @@ export async function loadProject(editor, data, { onWarning = console.warn } = {
     if ((data.version ?? 1) < 2 && o.kind === 'primitive' && RAMP_PRIMITIVES.includes(o.type) && o.props?.collider === 'box') {
       o.props.collider = 'ramp';
     }
-    try {
-      editor.objectsRoot.add(deserializeEntity(o, editor.assets));
-    } catch (err) {
-      onWarning(`Skipped object "${o.name}": ${err.message}`);
+  }
+  // Before v4 rigged models defaulted to a box collider (around their outstretched arms, and expensive for the
+  // playtest camera); they collide as capsules now.
+  if ((data.version ?? 1) < 4) {
+    for (const o of data.objects ?? []) {
+      if (o.kind === 'asset' && o.props?.collider === 'box' && editor.assets.get(o.assetId)?.rig) o.props.collider = 'capsule';
     }
   }
+  // v1/v2 objects have no `parent`, so they all load at the top level.
+  const { roots } = buildEntities(data.objects ?? [], editor.assets, (o, err) => onWarning(`Skipped object "${o.name}": ${err.message}`));
+  roots.forEach((r) => editor.objectsRoot.add(r));
   if (data.camera) {
     editor.camera.position.fromArray(data.camera.position);
     editor.orbit.target.fromArray(data.camera.target);

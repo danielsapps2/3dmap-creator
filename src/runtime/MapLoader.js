@@ -11,7 +11,9 @@
  *   const groundY = map.getHeightAt(x, z);
  *
  * Every exported node carries game data in `node.userData`:
- *   { mapType: 'primitive'|'asset'|'marker'|'terrain', id, collider, static, tags[], props{}, ... }
+ *   { mapType: 'primitive'|'asset'|'marker'|'group'|'terrain', id, collider, static, tags[], props{}, ... }
+ * Objects can have child objects (nested nodes, `userData.parentId`). A child attached to one of its parent's bones,
+ * like a prop held in a character's hand, is parented to that bone and has `userData.attachedTo` (the bone's name).
  */
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -40,6 +42,7 @@ export function createMap(root, gltf = null) {
     triggers: [],  // { node, name, event, size, contains(point) }
     waypoints: [],
     lights: [],
+    held: [],      // objects attached to a bone of their parent: { node, parent, bone, attachedTo, grip } — see hold.js
     colliders: [], // { node, type, box: Box3 (world AABB), isStatic, surfaceAt(), pushOut(), overlaps() } — see createCollider
     byId: new Map(),
     getHeightAt: () => 0,
@@ -54,6 +57,10 @@ export function createMap(root, gltf = null) {
       return best;
     },
     findByTag: (tag) => [...map.objects, ...map.markers].filter((n) => n.userData.tags?.includes(tag)),
+    /** The map object a node is a child of (null for top-level objects). */
+    parentOf: (node) => map.byId.get(node.userData.parentId) ?? null,
+    /** A map object's child objects. */
+    childrenOf: (node) => nodes.filter((n) => n.userData.parentId === node.userData.id),
     // GLTFLoader sanitizes node names ("Player Spawn" -> "Player_Spawn") and keeps the original in userData.name.
     findByName: (name) => root.getObjectByName(name) ?? findByOriginalName(root, name),
   };
@@ -65,9 +72,12 @@ export function createMap(root, gltf = null) {
     const ud = node.userData;
     if (ud.id) map.byId.set(ud.id, node);
     if (ud.castShadow !== undefined) {
-      node.traverse((m) => {
+      traverseOwn(node, (m) => {
         if (m.isMesh) { m.castShadow = !!ud.castShadow; m.receiveShadow = !!ud.receiveShadow; }
       });
+    }
+    if (ud.attachedTo) {
+      map.held.push({ node, parent: map.byId.get(ud.parentId) ?? null, bone: node.parent, attachedTo: ud.attachedTo, grip: ud.grip ?? null });
     }
 
     switch (ud.mapType) {
@@ -75,11 +85,14 @@ export function createMap(root, gltf = null) {
         map.terrain = node;
         map.getHeightAt = createHeightSampler(node);
         break;
+      case 'group':
+        map.objects.push(node);
+        break;
       case 'primitive':
       case 'asset':
         map.objects.push(node);
         if (ud.collider && ud.collider !== 'none') {
-          map.colliders.push(createCollider(node));
+          map.colliders.push(ud.collider === 'capsule' ? createCapsuleCollider(node) : createCollider(node));
         }
         break;
       case 'marker': {
@@ -120,6 +133,7 @@ const _p = new THREE.Vector3(), _up = new THREE.Vector3(), _n = new THREE.Vector
  *                                          `radius` outside the footprint. Writes the world surface normal to `normal`.
  *   overlaps(pos, radius)                → true when the circle (pos.x, pos.z, radius) touches the footprint.
  *   pushOut(pos, radius)                 → moves pos.x/pos.z to the nearest footprint edge (+radius); true if moved.
+ * Type 'capsule' builds an upright capsule instead (createCapsuleCollider).
  */
 export function createCollider(node) {
   const ud = node.userData;
@@ -157,7 +171,7 @@ export function createCollider(node) {
     node,
     type,
     isStatic: ud.static !== false,
-    box: new THREE.Box3().setFromObject(node),
+    box: local.clone().applyMatrix4(matrix),
     localBox: local,
     matrix,
     inverse,
@@ -188,10 +202,76 @@ export function createCollider(node) {
   };
 }
 
-/** Bounds of every mesh under `node`, in node-local space. */
+/**
+ * Upright capsule collider for characters (the editor's default for rigged models): cheap to test however detailed
+ * the model is, and the same shape as the player, so people bump into each other instead of into a box around
+ * outstretched arms. Its foot is at the base of the node's bounds, its radius comes from the model's thickness
+ * (0.12 m at least, 18% of its height at most). Same interface as createCollider, plus:
+ *   rayDistance(origin, dir, far) → distance along the ray to the capsule (approximated as a cylinder), or Infinity.
+ */
+export function createCapsuleCollider(node) {
+  const matrix = node.matrixWorld.clone();
+  const local = localBounds(node, matrix.clone().invert());
+  const world = local.clone().applyMatrix4(matrix);
+  const sx = new THREE.Vector3().setFromMatrixColumn(matrix, 0).length() || 1;
+  const sz = new THREE.Vector3().setFromMatrixColumn(matrix, 2).length() || 1;
+  const bottom = world.min.y, top = world.max.y, height = top - bottom;
+  const thickness = Math.min((local.max.x - local.min.x) * sx, (local.max.z - local.min.z) * sz);
+  const radius = Math.max(0.12, Math.min(0.18 * height, thickness / 2));
+  const c = local.getCenter(new THREE.Vector3()).applyMatrix4(matrix);
+  const cx = c.x, cz = c.z;
+  const up = new THREE.Vector3(0, 1, 0);
+  return {
+    node,
+    type: 'capsule',
+    isStatic: node.userData.static !== false,
+    box: new THREE.Box3(new THREE.Vector3(cx - radius, bottom, cz - radius), new THREE.Vector3(cx + radius, top, cz + radius)),
+    center: new THREE.Vector3(cx, bottom, cz),
+    radius,
+    height,
+    surfaceAt(x, z, r = 0, normal = null) {
+      if (Math.hypot(x - cx, z - cz) > radius + r) return null;
+      if (normal) normal.copy(up);
+      return top;
+    },
+    overlaps(pos, r = 0) {
+      return Math.hypot(pos.x - cx, pos.z - cz) < radius + r;
+    },
+    pushOut(pos, r = 0) {
+      const dx = pos.x - cx, dz = pos.z - cz, d = Math.hypot(dx, dz), min = radius + r + 1e-4;
+      if (d >= min) return false;
+      if (d < 1e-6) { pos.x = cx + min; return true; }
+      pos.x = cx + (dx / d) * min;
+      pos.z = cz + (dz / d) * min;
+      return true;
+    },
+    rayDistance(o, d, far = Infinity) {
+      // circle in XZ, then the hit's height must be within the capsule
+      const ox = o.x - cx, oz = o.z - cz, a = d.x * d.x + d.z * d.z, b = ox * d.x + oz * d.z, k = ox * ox + oz * oz - radius * radius;
+      let t;
+      if (k <= 0) t = 0; // starts inside
+      else {
+        if (a < 1e-9 || b > 0) return Infinity;
+        const disc = b * b - a * k;
+        if (disc < 0) return Infinity;
+        t = (-b - Math.sqrt(disc)) / a;
+      }
+      const y = o.y + d.y * t;
+      return t <= far && y >= bottom && y <= top ? t : Infinity;
+    },
+  };
+}
+
+/** Visit node and its descendants, skipping child map objects (and everything under them). */
+function traverseOwn(node, fn) {
+  fn(node);
+  for (const c of node.children) if (!c.userData?.mapType) traverseOwn(c, fn);
+}
+
+/** Bounds of every mesh of the node itself (not its child objects), in node-local space. */
 function localBounds(node, inverse) {
   const box = new THREE.Box3(), tmp = new THREE.Box3(), m = new THREE.Matrix4();
-  node.traverse((o) => {
+  traverseOwn(node, (o) => {
     if (!o.geometry) return;
     if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
     m.multiplyMatrices(inverse, o.matrixWorld);
