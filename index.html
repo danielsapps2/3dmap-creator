@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>3D Map Creator</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⛰</text></svg>" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar"></header>
+      <aside id="left">
+        <nav class="tabs" id="tabs"></nav>
+        <div class="tab-body" id="tab-build"></div>
+        <div class="tab-body" id="tab-terrain" hidden></div>
+        <div class="tab-body" id="tab-assets" hidden></div>
+        <div class="outliner" id="outliner">
+          <div class="panel-title">Scene</div>
+        </div>
+      </aside>
+      <main id="viewport">
+        <div id="viewport-hint"></div>
+      </main>
+      <aside id="right">
+        <div class="panel-title">Inspector</div>
+        <div id="inspector"></div>
+      </aside>
+      <footer id="status">
+        <span id="status-mode"></span>
+        <span id="status-cursor"></span>
+        <span id="status-info"></span>
+      </footer>
+    </div>
+    <div id="drop-overlay" hidden><div>Drop .glb / .gltf models, a project .json, or a heightmap image</div></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

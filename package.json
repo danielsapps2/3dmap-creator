@@ -1,0 +1,18 @@
+{
+  "name": "3dmap-creator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-based 3D map editor for three.js games: terrain sculpting, primitives, GLB asset placement, GLB export.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "vite": "^8.3.4"
+  }
+}
