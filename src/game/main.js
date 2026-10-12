@@ -1,4 +1,5 @@
 // Example game: a first-person walker that loads an exported map with MapLoader.js.
+import { PerfHud } from './PerfHud.js'; // first: it hooks WebGL before the context exists
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { parseMap, applyEnvironment } from '../runtime/MapLoader.js';
@@ -12,6 +13,7 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFShadowMap;
 document.body.prepend(renderer.domElement);
+const perf = new PerfHud(renderer);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color('#222');
@@ -202,9 +204,11 @@ window.addEventListener('resize', () => {
 const timer = new THREE.Timer();
 timer.connect(document);
 renderer.setAnimationLoop((t) => {
+  perf.begin();
   timer.update(t);
   update(Math.min(timer.getDelta(), 0.05));
   renderer.render(scene, camera);
+  perf.end();
 });
 
 (async () => {

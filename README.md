@@ -66,6 +66,8 @@ map.findByTag('loot');                  // nodes tagged in the editor
 map.byId.get(id);                       // stable ids survive re-export
 ```
 
+The playtest shows a performance overlay (toggle with `F3`): FPS, frame and CPU time, draw calls, triangles, and the GPU memory the page has allocated (textures, buffers, render targets, canvas), measured with [webgl-memory](https://github.com/greggman/webgl-memory). Browsers don't report total VRAM use, so this counts only what the page allocated.
+
 `src/game/main.js` is a complete working example: first-person movement, terrain-following, rotated box collisions, step-up, walkable ramps and stairs, sliding off slopes steeper than 50°, and trigger events.
 
 #### Colliders
