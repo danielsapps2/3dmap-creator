@@ -110,3 +110,7 @@ src/runtime/  MapLoader.js: drop-in loader for your game
 src/game/     First-person playtest demo (game.html)
 public/       Draco + Basis decoders for compressed GLBs
 ```
+
+## License
+
+[MIT](LICENSE). The Draco and Basis decoders in `public/` come from three.js and keep their own licenses (Apache-2.0).

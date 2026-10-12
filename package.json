@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Browser-based 3D map editor for three.js games: terrain sculpting, primitives, GLB asset placement, GLB export.",
+  "license": "MIT",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
