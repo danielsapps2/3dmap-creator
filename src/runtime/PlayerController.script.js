@@ -1,7 +1,11 @@
 // Player controller: how the player moves, looks around and switches views. Attach it to the Player Spawn (the
 // editor does that from the spawn's Inspector) and change anything here: speeds, jumping, the camera, the keys.
 // Without one, the playtest runs this script with the spawn's settings. It's an ordinary script, plus:
-//   this.game.player   position (feet), velocity, onGround, groundNormal, character, spawn, respawn(), teleport()
+//   this.game.player   position (feet), velocity, onGround, groundNormal, character (its .settings: fields of this
+//                      script the character plays with, from its model meta), spawn, respawn(), teleport(),
+//                      locomotion({ idle, walk, run, back, left, right }, { walk, run }, rates): walk the character
+//                      with these library clips, at these speeds (m/s); rates { idle, walk, … }: each clip's
+//                      playback speed (× 1)
 //   this.game.physics  move(dt, { radius, height, step, maxSlope }): walk the player by its velocity, with collisions
 //                      cameraClearance(origin, dir, max): how far a camera can sit along a ray before hitting the map
 //   this.game.view     mode ('first' | 'third'), facing ('free' | 'strafe'), set(mode), setFacing(facing)
@@ -9,9 +13,12 @@
 //                      keyboard: focused, menu closed), locked (the mouse is captured: click the game to capture it)
 export const controlsPlayer = true;
 
+// a moving clip's playback speed: the cadence changes, the movement speed doesn't
+const STEPS = 'Quicker, shorter steps (above 1) or slower, longer ones (below 1) at the same movement speed. 1 keeps the feet planted.';
+
 export const params = {
-  walkSpeed: { type: 'number', default: 6, min: 0.1, step: 0.1, label: 'Walk speed (m/s)', title: 'First person. In third person the character moves at its animation speed.' },
-  runSpeed: { type: 'number', default: 11, min: 0.1, step: 0.1, label: 'Run speed (m/s)', title: 'First person, with Shift' },
+  walkSpeed: { type: 'number', default: 1.6, min: 0.1, step: 0.1, label: 'Walk speed (m/s)', title: 'Both views. In third person the walk clips play faster or slower to match (walking back and strafing scale with it), so the feet stay planted.' },
+  runSpeed: { type: 'number', default: 4, min: 0.1, step: 0.1, label: 'Run speed (m/s)', title: 'With Shift, in both views. The run clip plays faster or slower to match.' },
   jump: { type: 'number', default: 8, min: 0, step: 0.1, label: 'Jump speed', title: 'Upward speed when jumping (m/s). Jump height ≈ speed² / (2 × gravity).' },
   gravity: { type: 'number', default: 24, min: 0.1, step: 0.5, label: 'Gravity (m/s²)' },
   airControl: { type: 'number', default: 0.3, min: 0, max: 1, step: 0.05, label: 'Air control' },
@@ -24,6 +31,19 @@ export const params = {
   facing: { type: 'select', options: [['', 'Player\'s choice'], ['free', 'Turns to move'], ['strafe', 'Strafe (faces camera)']], default: '', label: 'Facing' },
   cameraDistance: { type: 'number', default: 4.5, min: 1.2, max: 14, step: 0.1, label: '3rd-person distance' },
   mouseSensitivity: { type: 'number', default: 1, min: 0.1, max: 5, step: 0.1, label: 'Mouse sensitivity' },
+  // the character's movement animation: clips from the engine's library, blended by speed and direction
+  idleClip: { type: 'clip', default: 'Idle', label: 'Idle clip' },
+  idleRate: { type: 'number', default: 1, min: 0.05, max: 5, step: 0.05, label: 'Idle clip speed (×)', title: 'Plays the idle clip faster or slower' },
+  walkClip: { type: 'clip', default: 'Walk', label: 'Walk clip' },
+  walkRate: { type: 'number', default: 1, min: 0.05, max: 5, step: 0.05, label: 'Walk clip speed (×)', title: STEPS },
+  runClip: { type: 'clip', default: 'Run', label: 'Run clip', title: 'Shift. None: it only walks' },
+  runRate: { type: 'number', default: 1, min: 0.05, max: 5, step: 0.05, label: 'Run clip speed (×)', title: STEPS },
+  backClip: { type: 'clip', default: 'WalkBackward', label: 'Walk back clip', title: 'S, when facing the camera (strafe)' },
+  backRate: { type: 'number', default: 1, min: 0.05, max: 5, step: 0.05, label: 'Walk back clip speed (×)', title: STEPS },
+  leftClip: { type: 'clip', default: 'StrafeLeft', label: 'Strafe left clip', title: 'A, when facing the camera (strafe)' },
+  leftRate: { type: 'number', default: 1, min: 0.05, max: 5, step: 0.05, label: 'Strafe left clip speed (×)', title: STEPS },
+  rightClip: { type: 'clip', default: 'StrafeRight', label: 'Strafe right clip', title: 'D, when facing the camera (strafe)' },
+  rightRate: { type: 'number', default: 1, min: 0.05, max: 5, step: 0.05, label: 'Strafe right clip speed (×)', title: STEPS },
 };
 
 const angleTo = (a, b) => Math.atan2(Math.sin(b - a), Math.cos(b - a));
@@ -40,8 +60,29 @@ export default class PlayerController {
     if (p.view) game.view.set(p.view, { sticky: true });
     if (p.facing) game.view.setFacing(p.facing);
     this.faceSpawn();
+    this.useClips();
     game.on('respawn', () => this.faceSpawn());
     game.on('viewChanged', ({ mode }) => this.keepLooking(mode));
+    game.on('characterChanged', () => this.useClips()); // a character picked in the menu walks with them too
+  }
+
+  /**
+   * The character's movement animation: these clips, blended by speed and direction like tinyimgen's own
+   * locomotion (the feet stay planted, on any tinyimgen body), sped up or slowed down to the walk and run speeds,
+   * then by each clip's own speed. A character with its own settings (Mechanic's walk and run speeds, say) plays
+   * with those instead of these fields, in both views.
+   */
+  useClips() {
+    const p = this.settings = { ...this.params, ...this.game.player.character?.settings };
+    try {
+      this.game.player.locomotion(
+        { idle: p.idleClip, walk: p.walkClip, run: p.runClip, back: p.backClip, left: p.leftClip, right: p.rightClip },
+        { walk: p.walkSpeed, run: p.runSpeed },
+        { idle: p.idleRate, walk: p.walkRate, run: p.runRate, back: p.backRate, left: p.leftRate, right: p.rightRate },
+      );
+    } catch (err) {
+      this.game.message(`Player animation: ${err.message}`, 6);
+    }
   }
 
   /** Spawns face -Z like a camera; characters face +Z, so the body turns around. */
@@ -65,7 +106,7 @@ export default class PlayerController {
   }
 
   update(dt) {
-    const { game, params: p, THREE } = this;
+    const { game, settings: p, THREE } = this;
     const { input, player, view } = game;
     const active = input.active;  // the game has the keyboard
     const looking = input.locked; // the mouse is captured, so moving it looks around
@@ -122,9 +163,9 @@ export default class PlayerController {
     }
   }
 
-  /** The character's animation sets the speed (feet stay planted); this steers it. */
+  /** The character's animation moves it, at the walk and run speeds (feet stay planted); this steers it. */
   moveThirdPerson(dt, ix, iz, running, steep) {
-    const { game, params: p, orbit } = this;
+    const { game, settings: p, orbit } = this;
     const { player, view } = game;
     let move;
     if (view.facing === 'strafe') {

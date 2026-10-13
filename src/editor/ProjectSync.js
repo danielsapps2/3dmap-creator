@@ -1,9 +1,9 @@
 // Keeps the editor's project and its folder (ProjectFolder.js) in step: opening and saving folders, writing scripts,
-// models and clips as soon as they change, and taking in what changes on disk (VS Code, a file manager).
+// and models as soon as they change, and taking in what changes on disk (VS Code, a file manager). Animation clips
+// aren't the project's: they live in the engine (EngineClips.js). An older project's clips/ joins the engine once.
 // Without a folder the project's files live in memory (and the autosave) until the first save picks one.
 import { ProjectFolder, folderSupported } from './ProjectFolder.js';
 import { serializeProject, loadProject } from './Project.js';
-import { uid } from '../core/utils.js';
 
 export class ProjectSync extends EventTarget {
   /**
@@ -20,7 +20,6 @@ export class ProjectSync extends EventTarget {
     this._writing = null;
     const soon = () => this.scheduleWrite();
     editor.scripts.addEventListener('changed', soon);
-    editor.clips.addEventListener('changed', soon);
     editor.assets.addEventListener('changed', soon);
   }
 
@@ -34,7 +33,7 @@ export class ProjectSync extends EventTarget {
     return {
       scripts: ed.scripts.list(),
       assets: ed.assets.list().map((a) => ({ id: a.id, name: a.fileName, path: a.path, buffer: a.buffer, meta: a.meta })),
-      clips: ed.clips.clips,
+      clips: [], // the engine's (EngineClips.js), not the project's
     };
   }
 
@@ -48,7 +47,7 @@ export class ProjectSync extends EventTarget {
 
   // ------------------------------------------------------------------ write-through
 
-  /** Write changed scripts / models / clips to the folder shortly (they're files: no Ctrl+S needed). */
+  /** Write changed scripts / models to the folder shortly (they're files: no Ctrl+S needed). */
   scheduleWrite() {
     if (!this.folder?.attached) return;
     clearTimeout(this._timer);
@@ -80,7 +79,9 @@ export class ProjectSync extends EventTarget {
       const data = await fresh.load();
       this.setFolder(null);
       await loadProject(this.editor, data, { onWarning: (m) => this.ui.toast(m, { type: 'error', timeout: 6000 }), mergeClips: false });
-      this.editor.clips.load(data.clips); // a folder's clips are its own (clips/)
+      // clips/ from before clips lived in the engine: the ones the engine doesn't have join it (its own win)
+      const added = this.editor.clips.addMissing(data.clips);
+      if (added.length) this.ui.toast(`Added ${added.map((c) => c.name).join(', ')} from ${f.name}/clips/ to the engine's clips`, { type: 'ok', timeout: 5000 });
       this.setFolder(fresh);
       this.ui.toast(`Opened ${fresh.name}/`, { type: 'ok' });
       return true;
@@ -104,7 +105,7 @@ export class ProjectSync extends EventTarget {
         else if (await f.hasProject()) {
           if (!(await this.ui.confirm('Replace project?', `“${f.name}” already holds a project. Replace it with this one?`, 'Replace'))) return false;
         } else if (!(await f.isEmpty())) {
-          if (!(await this.ui.confirm('Save into this folder?', `“${f.name}” isn't empty. The project goes in alongside what's there: project.json, scripts/, assets/, clips/ and terrain/.`, 'Save here'))) return false;
+          if (!(await this.ui.confirm('Save into this folder?', `“${f.name}” isn't empty. The project goes in alongside what's there: project.json, scripts/, assets/ and terrain/.`, 'Save here'))) return false;
         }
       }
       await this._writing;
@@ -151,7 +152,7 @@ export class ProjectSync extends EventTarget {
   // ------------------------------------------------------------------ changes on disk
 
   _watch() {
-    const { scripts, clips, assets } = this.editor;
+    const { scripts, assets } = this.editor;
     const { toast } = this.ui;
     this.folder.watch({
       script: ({ path, text }) => {
@@ -172,23 +173,6 @@ export class ProjectSync extends EventTarget {
         if (!s) return;
         scripts.remove(s.id); // objects keep the reference, shown as a missing script
         toast(`${path} was deleted on disk`, { type: 'error', timeout: 5000 });
-      },
-      clip: ({ path, clip }) => {
-        const mine = clips.byPath(path);
-        if (!mine) return;
-        Object.assign(mine, clip, { id: mine.id, path });
-        clips.changed();
-        toast(`${path} changed on disk`, { timeout: 1800 });
-        this.ui.reloadGame?.();
-      },
-      clipAdded: ({ path, clip }) => {
-        if (clips.byPath(path)) return;
-        clips.merge([{ ...clip, id: clip.id && !clips.get(clip.id) ? clip.id : uid(), path }]);
-        toast(`New clip: ${path}`, { type: 'ok' });
-      },
-      clipRemoved: (path) => {
-        const c = clips.byPath(path);
-        if (c) { clips.remove(c.id); toast(`${path} was deleted on disk`, { type: 'error', timeout: 5000 }); }
       },
       modelAdded: async ({ path, buffer }) => {
         if (assets.byPath(path)) return;

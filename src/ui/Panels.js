@@ -4,6 +4,7 @@ import { MARKERS } from '../editor/Markers.js';
 import { entityIcon, childEntities, parentEntity, isWithin } from '../editor/Entities.js';
 import { entityRig } from '../editor/Rig.js';
 import { tinyimgenCatalog, importTinyimgen } from '../editor/Tinyimgen.js';
+import { engineCatalog, engineEvents, importEngineModel, findEngineCopy } from '../editor/EngineModels.js';
 import { formatBytes } from '../core/utils.js';
 
 // ====================================================================== Build
@@ -166,11 +167,13 @@ export function terrainPanel(root, editor, { importHeightmap, exportHeightmap })
 export function assetsPanel(root, editor, { importGLB }) {
   const list = h('div', { class: 'asset-list' });
   const tiny = h('div', { class: 'tiny-body' });
+  const shared = h('div', { class: 'tiny-body' });
   root.append(
     h('div', { class: 'dropzone', onclick: importGLB },
       h('strong', {}, 'Import GLB / glTF'),
       h('span', {}, 'Click or drop files anywhere on the window'),
     ),
+    section('Engine models', shared),
     section('tinyimgen', tiny, { actions: button('↻', (e) => { e.preventDefault(); loadTiny(true); }, { cls: 'btn-ghost btn-sm', title: 'Refresh the list from tinyimgen' }) }),
     section('Library', list),
   );
@@ -190,21 +193,75 @@ export function assetsPanel(root, editor, { importGLB }) {
     }
     renderTiny();
   };
+  /** Place a model, or with a character selected, put a holdable prop in its hand. */
+  const placeOrHold = (asset) => {
+    const holder = editor.selected && entityRig(editor.selected, editor.assets) ? editor.selected : null;
+    if (asset.prop && holder) {
+      const hand = editor.freeHand(holder, asset.prop.hand);
+      if (editor.holdProp(holder, asset.id, hand)) toast(`${holder.name} holds ${asset.name} in the ${hand.toLowerCase()} hand`, { type: 'ok' });
+      else editor.startPlacement({ kind: 'asset', assetId: asset.id });
+    } else {
+      editor.startPlacement({ kind: 'asset', assetId: asset.id });
+    }
+  };
+
+  // The engine's shared models (engine/models/): a project's copy follows the engine file when it changes.
+  let engineList = null, engineError = null;
+  const loadEngine = async () => {
+    try {
+      engineList = await engineCatalog();
+      engineError = null;
+    } catch (err) {
+      engineList = null;
+      engineError = err.message;
+    }
+    renderEngine();
+  };
+  const useEngineItem = async (item) => {
+    const key = `engine:${item.file}`;
+    if (busy.has(key)) return;
+    busy.add(key);
+    renderEngine();
+    try {
+      placeOrHold(await importEngineModel(editor, item));
+    } catch (err) {
+      console.error(err);
+      toast(`Couldn't use ${item.name}: ${err.message}`, { type: 'error', timeout: 6000 });
+    } finally {
+      busy.delete(key);
+      renderEngine();
+    }
+  };
+  const renderEngine = () => {
+    if (engineError) { shared.replaceChildren(h('p', { class: 'hint' }, `${engineError}.`)); return; }
+    if (!engineList) return;
+    if (!engineList.length) {
+      shared.replaceChildren(h('p', { class: 'hint' }, 'None yet. In the Files tab, right-click a model in assets/ and pick "Copy to the engine" to share it with every project.'));
+      return;
+    }
+    shared.replaceChildren(
+      h('div', { class: 'tiny-grid' }, ...engineList.map((item) => {
+        const copy = findEngineCopy(editor, item.file), loading = busy.has(`engine:${item.file}`);
+        const role = item.meta?.tinyimgen?.role;
+        const what = role === 'character' ? 'Character' : role === 'prop' ? 'Holdable prop' : formatBytes(item.size);
+        return h('button', { class: `tiny-card${loading ? ' busy' : ''}`, title: `engine/models/${item.file}`, onclick: () => useEngineItem(item) },
+          copy?.thumbnail ? h('img', { src: copy.thumbnail, alt: '' }) : h('span', { class: 'thumb-ph' }, role === 'prop' ? '🗡' : role === 'character' ? '🧍' : '⬢'),
+          h('span', { class: 'tiny-name' }, item.name),
+          h('small', {}, loading ? 'Downloading…' : copy ? `${what} · in project` : what));
+      })),
+      h('p', { class: 'hint' }, 'Shared by every project. Change a model in the editor\'s engine/models/ folder and every project using it updates.'),
+    );
+  };
+  engineEvents.addEventListener('changed', loadEngine);
+  loadEngine();
+
   const useItem = async (item) => {
     const key = `${item.role}:${item.id}`;
     if (busy.has(key)) return;
     busy.add(key);
     renderTiny();
     try {
-      const asset = await importTinyimgen(editor, item);
-      const holder = editor.selected && entityRig(editor.selected, editor.assets) ? editor.selected : null;
-      if (asset.prop && holder) {
-        const hand = editor.freeHand(holder, asset.prop.hand);
-        if (editor.holdProp(holder, asset.id, hand)) toast(`${holder.name} holds ${asset.name} in the ${hand.toLowerCase()} hand`, { type: 'ok' });
-        else editor.startPlacement({ kind: 'asset', assetId: asset.id });
-      } else {
-        editor.startPlacement({ kind: 'asset', assetId: asset.id });
-      }
+      placeOrHold(await importTinyimgen(editor, item));
     } catch (err) {
       console.error(err);
       toast(`Couldn't import ${item.name}: ${err.message}`, { type: 'error', timeout: 6000 });
@@ -242,6 +299,7 @@ export function assetsPanel(root, editor, { importGLB }) {
 
   const render = () => {
     renderTiny();
+    renderEngine();
     const assets = editor.assets.list();
     const counts = new Map();
     editor.objects.forEach((o) => { if (o.entity.kind === 'asset') counts.set(o.entity.assetId, (counts.get(o.entity.assetId) ?? 0) + 1); });

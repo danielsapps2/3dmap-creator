@@ -310,3 +310,4 @@ body.playing #viewport { outline: 2px solid var(--play); outline-offset: -2px; }
 .fx-drop { outline: 2px dashed var(--accent) !important; outline-offset: -2px; }
 .menu-item.danger { color: #ffb3b3; }
 .prompt-input { width: 100%; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px 8px; }
+.hint.warn { color: #f2c94c; }

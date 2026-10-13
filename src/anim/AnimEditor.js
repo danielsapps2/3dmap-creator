@@ -10,7 +10,7 @@ import { clone as skeletonClone } from 'three/addons/utils/SkeletonUtils.js';
 import { h, button, toast, modal, numberInput, checkbox, select, textInput, row, section } from '../ui/dom.js';
 import { BONES, mirrorName, findBones, restPositions } from './skeleton.js';
 import {
-  FPS, isLocomotion, createClip, duplicateClip, editState, applyEditState, frameCount, rigOf, applyPose,
+  FPS, createClip, duplicateClip, editState, applyEditState, frameCount, rigOf, applyPose,
   boneRotation, baseRotation, baseHips, hipsOffset, clipFromThree, restArrays, retargetFor,
 } from './clips.js';
 import { PACKS, loadPack, importMesh2Motion } from './mesh2motion.js';
@@ -343,10 +343,8 @@ export class AnimEditor {
 
   _renderClips() {
     if (!this.root) return;
-    const actions = this.library.actions();
     const items = this.library.clips.map((c) => {
-      const slot = actions.indexOf(c);
-      const role = isLocomotion(c) ? `replaces ${c.name}` : slot >= 0 ? `key ${slot + 1}` : '';
+      const role = c.gait ? 'gait' : '';
       const kind = c.base ? (c.source.startsWith('mesh2motion') ? 'Mesh2Motion' : 'character') : 'keyframed';
       return h('div', { class: `anim-clip${c === this.clip ? ' active' : ''}`, onclick: () => this.selectClip(c.id), title: c.source },
         h('div', { class: 'anim-clip-name' }, h('span', {}, c.name), role ? h('span', { class: 'badge' }, role) : null),
@@ -370,7 +368,7 @@ export class AnimEditor {
         button('Delete', () => this._deleteClip(), { cls: 'btn-sm btn-danger' })),
       h('div', { class: 'panel-title' }, 'Import'),
       h('div', { class: 'btn-row' }, fromChar, button('Mesh2Motion…', () => this._mesh2motionDialog(), { cls: 'btn-sm', title: '178 free (CC0) human animations, retargeted to tinyimgen\'s skeleton' })),
-      h('p', { class: 'hint' }, 'In the playtest, clips named Idle, Walk, Run, WalkBackward, StrafeLeft or StrafeRight replace the character\'s own; the others play on keys 1–9 in this order.'),
+      h('p', { class: 'hint' }, 'The engine\'s clips, shared by every project. The player controller picks which ones it walks with; scripts play the others (player.playClip).'),
     );
   }
 
@@ -395,7 +393,7 @@ export class AnimEditor {
     const rest = rigOf(this.asset.scene);
     const clip = clipFromThree(threeClip, rest, { source: `${this.asset.meta.tinyimgen ? 'tinyimgen' : 'character'}:${threeClip.name}` });
     this._addClip(clip);
-    toast(`Imported ${clip.name}${isLocomotion(clip) ? ': it now replaces the character\'s own in the playtest' : ''}`, { type: 'ok' });
+    toast(`Imported ${clip.name} into the engine's clips${clip.gait ? ' (with its gait: the player controller can walk with it)' : ''}`, { type: 'ok' });
   }
 
   _deleteClip() {
@@ -466,15 +464,14 @@ export class AnimEditor {
     if (!clip) {
       out.push(h('p', { class: 'hint' }, 'Pick a clip on the left, or make a new one.'));
     } else {
-      const slot = this.library.actions().indexOf(clip);
       out.push(section('Clip', [
         row('Name', textInput({ value: clip.name, onChange: (v) => this.edit('Rename', () => { clip.name = this.library.uniqueName(v.trim() || clip.name, clip); }) })),
         row('Length (s)', numberInput({ value: clip.duration, step: 0.1, min: 0.1, max: 120, onChange: (v) => this.edit('Length', () => { clip.duration = v; }) })),
         row('Loop', checkbox({ value: clip.loop, onChange: (v) => this.edit('Loop', () => { clip.loop = v; }), label: 'Plays on repeat' })),
         row('Between keys', select({ value: clip.interp, options: [['smooth', 'Smooth'], ['linear', 'Linear']], onChange: (v) => this.edit('Interpolation', () => { clip.interp = v; }) })),
-        h('p', { class: 'hint' }, isLocomotion(clip)
-          ? `Replaces the character's own ${clip.name} clip in the playtest. Keep its length to keep the feet planted.`
-          : slot >= 0 ? `Playtest: press ${slot + 1} to play it.` : 'Playtest: only the first 9 non-locomotion clips get a key.'),
+        h('p', { class: 'hint' }, clip.gait
+          ? `A locomotion cycle: ${clip.gait.speed > 0 ? `moves ${clip.gait.speed.toFixed(2)} m/s on the character it was captured on, fitted to each body's leg length` : 'standing'}. Pick it in the player controller's clip fields. Keep its length to keep the feet planted.`
+          : 'Plays from scripts (game.animator, playClip).'),
         h('p', { class: 'hint' }, clip.base ? `Base motion: ${clip.source} (${clip.base.frames} frames). Keys adjust it.` : 'Keyframed from the rest pose.'),
         this.rig && retargetFor(clip, this.rig) ? h('p', { class: 'hint' }, 'Made on another character\'s skeleton: shown here as made. In the game it\'s fitted to each character\'s own proportions.') : null,
         h('div', { class: 'btn-row' }, button('Clear all keys', () => this.edit('Clear keys', () => { clip.keys = {}; clip.hipKeys = []; }), { cls: 'btn-sm btn-danger' })),

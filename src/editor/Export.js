@@ -5,7 +5,6 @@ import { customPropsToObject, isEditorOnly, childEntities, parentEntity, isShown
 import { holdData } from './Rig.js';
 import { usedScripts } from './Scripts.js';
 import { findBones } from '../anim/skeleton.js';
-import { rigOf, clipFromThree, LOCOMOTION } from '../anim/clips.js';
 import { arrayBufferToBase64 } from '../core/utils.js';
 
 export const MAP_FORMAT = '3dmap-creator';
@@ -153,26 +152,15 @@ export function buildExportScene(editor, { includeTerrain = true, includeMarkers
 }
 
 /**
- * Clips for animating the map's tinyimgen characters from code (runtime/animator.js): the editor's clip library,
- * plus each character's own locomotion clips (Idle, Walk…), marked with `owner` (the model's name, as in
- * userData.asset): every character plays its own, fitted to its body by tinyimgen, unless the library has one by
- * that name. Empty without characters.
+ * Clips for animating the map's tinyimgen characters from code (runtime/animator.js, runtime/clipLocomotion.js): the
+ * animation library (the engine's clips). Empty without characters.
  */
 function animationClips(editor, objects) {
-  const characters = [...new Set(objects.filter((o) => o.entity.kind === 'asset').map((o) => editor.assets.get(o.entity.assetId)))]
-    .filter((a) => a?.rig && findBones(a.scene));
-  if (!characters.length) return [];
-  const clips = [...(editor.clips?.clips ?? [])];
-  for (const owner of characters) {
-    owner._clipCache ??= new Map();
-    for (const name of LOCOMOTION) {
-      const own = owner.animations.find((c) => c.name === name);
-      if (!own || clips.some((c) => c.name === name && !c.owner)) continue;
-      if (!owner._clipCache.has(name)) owner._clipCache.set(name, clipFromThree(own, rigOf(owner.scene), { source: `character:${name}` }));
-      clips.push({ ...owner._clipCache.get(name), owner: owner.name });
-    }
-  }
-  return clips;
+  const characters = objects.some((o) => {
+    const scene = o.entity.kind === 'asset' && editor.assets.get(o.entity.assetId)?.scene;
+    return !!scene && !!findBones(scene);
+  });
+  return characters ? [...(editor.clips?.clips ?? [])].map(({ path, ...clip }) => clip) : [];
 }
 
 /** Clips as glTF extras (plain JSON): Float32Arrays become { $f32: base64 } (decodeClips in runtime/animator.js). */

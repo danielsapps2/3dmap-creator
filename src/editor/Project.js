@@ -15,7 +15,7 @@ export function serializeProject(editor) {
     terrain: editor.terrain.toJSON(),
     assets: editor.assets.list().map((a) => ({ id: a.id, name: a.fileName, path: a.path, buffer: a.buffer, meta: a.meta })),
     objects: editor.objects.map(serializeEntity), // parents before children; transforms are local to the parent
-    clips: editor.clips?.toJSON() ?? [], // the shared animation library (v5), so a project carries its clips along
+    clips: [], // projects don't keep clips: the library lives in the engine (EngineClips.js)
     scripts: editor.scripts?.toJSON() ?? [], // the map's scripts (v5); objects refer to them by id
     camera: { position: editor.camera.position.toArray(), target: editor.orbit.target.toArray() },
     settings: {
@@ -74,7 +74,7 @@ export async function loadProject(editor, data, { onWarning = console.warn, merg
     editor.setSnap(data.settings.snap ?? {});
     if (Number.isFinite(data.settings.flySpeed)) editor.fly.speed = Math.min(500, Math.max(1, data.settings.flySpeed));
   }
-  if (mergeClips) editor.clips?.merge(data.clips);
+  if (mergeClips) editor.clips?.addMissing(data.clips); // an older project's clips join the engine's (its own win)
   editor.history.clear();
   editor.emit('sceneChanged');
   editor.emit('terrainChanged');

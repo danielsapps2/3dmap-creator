@@ -51,9 +51,10 @@ const FSM = [
 const INPUT = [['isDown(code)', 'Held now'], ['pressed(code)', 'Went down this frame'], ['mouse', '{ dx, dy, wheel } this frame'], ['locked', 'The mouse is captured (the game has the keyboard)']];
 const PLAYER = [
   ['position', 'Feet position (Vector3)'], ['velocity', 'Vector3, m/s'], ['onGround', 'Standing on something (writable)'],
-  ['groundNormal', 'Normal of the ground underfoot'], ['character', 'The player character (null in a capsule-free map): root, height, update(dt, move, running), playAction(i)'],
+  ['groundNormal', 'Normal of the ground underfoot'], ['character', 'The player character (null in a capsule-free map): root, height, settings (controller fields from its model meta), update(dt, move, running) (after locomotion()), playAction(i)'],
   ['spawn', 'The Player Spawn: position, rotationY, params'], ['respawn()', 'Back to the spawn'],
   ['teleport(x, y, z)', 'Move the player'], ['playClip(name)', 'Play a clip from the animation library on the player character'],
+  ['locomotion(states, speeds, rates)', 'Walk the character with library clips: { idle, walk, run, back, left, right } (clip names); speeds { walk, run } in m/s; rates: each clip\'s playback speed (× 1). Call it in start() and on \'characterChanged\''],
 ];
 const PHYSICS = [
   ['move(dt, body)', 'Walk the player by its velocity: walls, steps, ramps, landing. body: { radius, height, step, maxSlope }'],

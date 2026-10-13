@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { h, row, section, numberInput, slider, vec3Input, colorInput, checkbox, select, textInput, button, toast } from './dom.js';
+import { h, row, section, numberInput, slider, vec3Input, colorInput, checkbox, select, textInput, button, toast, modal } from './dom.js';
 import { PRIMITIVES } from '../editor/Primitives.js';
 import { MARKERS } from '../editor/Markers.js';
 import {
@@ -214,7 +214,7 @@ export class Inspector {
       // A spawn with a player controller script keeps its movement and camera settings in the script's params.
       const controller = e.type === 'spawn' && ed.scripts ? e.scripts.find((r) => ed.scripts.isController(r.id)) : null;
       if (e.type === 'spawn' && !controller) {
-        groups.get('Movement')?.push(h('p', { class: 'hint' }, 'Used by ▶ Play and exported in this node\'s userData.params. Walk and run speeds apply in first person; in third person the character moves at its animation\'s speed.'));
+        groups.get('Movement')?.push(h('p', { class: 'hint' }, 'Used by ▶ Play and exported in this node\'s userData.params. Walk and run speeds apply in both views: in third person the walk and run clips play faster or slower to match. Characters with their own settings (a \'controller\' block in the model\'s meta, like the engine\'s Mechanic and Dark Fantasy Soldier) play with those instead.'));
       }
       for (const [title, rows] of groups) {
         if (controller && (title === 'Camera' || title === 'Movement')) continue;
@@ -473,9 +473,19 @@ export class Inspector {
   _controllerSection(obj, controller) {
     const ed = this.editor, lib = ed.scripts;
     if (controller) {
+      const script = lib.get(controller.id);
+      // a copy of an older built-in controller (made before it picked walking clips and speeds, for example)
+      const outdated = script && script.source !== CONTROLLER_SOURCE && !/\.locomotion\(/.test(script.source);
+      const update = () => modal('Update the player controller', h('p', {},
+        `Replace the code of “${script.name}” with the editor's current built-in controller? Its fields keep their values; changes you made to its code are lost.`), {
+        actions: [{ label: 'Cancel', run: () => {} }, { label: 'Update', cls: 'btn-primary', run: () => { lib.update(script.id, { source: CONTROLLER_SOURCE }); this.render(); } }],
+      });
       return section('Player controller', [
-        h('p', { class: 'hint' }, `Movement, camera and view settings are the “${lib.get(controller.id)?.name}” script's fields below; its code is how the player moves.`),
-        h('div', { class: 'btn-row' }, button('Edit the code', () => ed.emit('openScript', controller.id), { cls: 'btn-sm' })),
+        h('p', { class: 'hint' }, `Movement, camera and view settings are the “${script?.name}” script's fields below; its code is how the player moves. Characters with their own settings (a 'controller' block in the model's meta, like the engine's Mechanic and Dark Fantasy Soldier) play with those instead.`),
+        outdated ? h('p', { class: 'hint warn' }, 'This script is a copy of an older built-in controller: it doesn\'t pick the character\'s walking clips, so in third person the character won\'t animate or follow the walk and run speeds.') : null,
+        h('div', { class: 'btn-row' },
+          button('Edit the code', () => ed.emit('openScript', controller.id), { cls: 'btn-sm' }),
+          script && script.source !== CONTROLLER_SOURCE ? button('Update to the built-in controller…', update, { cls: `btn-sm${outdated ? ' btn-primary' : ''}`, title: 'Replace its code with the editor\'s current built-in controller' }) : null),
       ]);
     }
     const make = () => {
@@ -501,9 +511,9 @@ export class Inspector {
         : def.type === 'bool' ? checkbox({ value: !!value, onChange: setParam(i, key, true) })
         : def.type === 'color' ? colorInput({ value, onInput: setParam(i, key, false), onChange: setParam(i, key, true) })
         : def.type === 'select' ? select({ value: String(value), options: opts, onChange: setParam(i, key, true) })
-        : def.type === 'clip' ? select({ // a clip from the animation library (plus the characters' own Idle, Walk…)
+        : def.type === 'clip' ? select({ // a clip from the animation library (the engine's clips)
           value: String(value ?? ''),
-          options: [...new Set(['', ...(ed.clips?.clips.map((c) => c.name) ?? []), 'Idle', 'Walk', 'Run', String(value ?? '')])].map((n) => [n, n || '(none)']),
+          options: [...new Set(['', ...(ed.clips?.clips.map((c) => c.name) ?? []), String(value ?? '')])].map((n) => [n, n || '(none)']),
           onChange: setParam(i, key, true),
         })
         : textInput({ value, onChange: setParam(i, key, true) });

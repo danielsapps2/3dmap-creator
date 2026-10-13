@@ -1,10 +1,12 @@
-// The Files tab: the project's files (scripts/, assets/, clips/) as a tree, plus what the engine provides (script
-// templates, tinyimgen models) to copy into the project. Scripts drag onto objects (viewport, Scene list, Inspector)
+// The Files tab: the project's files (scripts/, assets/) as a tree, plus what the engine provides: script templates,
+// shared models and tinyimgen models to copy into the project, and the animation clips every project uses. A model copied from the engine
+// stays linked to it: when the engine's file changes, every project's copy follows (EngineModels.js). Scripts drag onto objects (viewport, Scene list, Inspector)
 // to attach; models click to place; clips open in the animation editor. With a project folder open, every change
 // here is a change on disk (ProjectSync writes it).
 import { h, button, toast, modal, contextMenu, prompt } from './dom.js';
 import { TEMPLATES } from '../editor/Scripts.js';
 import { tinyimgenCatalog, importTinyimgen } from '../editor/Tinyimgen.js';
+import { engineCatalog, engineEvents, importEngineModel, findEngineCopy, copyToEngine, unlinkEngine, engineLink } from '../editor/EngineModels.js';
 import { duplicateClip, createClip } from '../anim/clips.js';
 import { baseName, dirName, fileStem, uniquePath } from '../core/paths.js';
 import { formatBytes, pickFiles } from '../core/utils.js';
@@ -18,9 +20,10 @@ const ICON = { script: '📜', template: '📜', model: '🧊', clip: '🎞', fo
  */
 export function explorer(root, editor, sync, actions) {
   const { scripts, assets, clips } = editor;
-  const open = new Set(['scripts', 'assets', 'clips', 'engine', 'engine/templates']);
+  const open = new Set(['scripts', 'assets', 'clips', 'engine', 'engine/templates', 'engine/models']);
   let selected = null; // path (or engine key)
   let tiny = null;     // tinyimgen catalog, once loaded
+  let engineList = null; // the engine's shared models ({ error } when unavailable), once loaded
 
   // ---------------------------------------------------------------- operations
 
@@ -100,6 +103,27 @@ export function explorer(root, editor, sync, actions) {
       toast(`Couldn't import ${item.name}: ${err.message}`, { type: 'error', timeout: 6000 });
     }
   };
+  const useSharedModel = async (item) => {
+    try {
+      placeModel(await importEngineModel(editor, item)); // copied into assets/, linked to the engine file
+    } catch (err) {
+      toast(`Couldn't use ${item.name}: ${err.message}`, { type: 'error', timeout: 6000 });
+    }
+  };
+  const toEngine = async (a) => {
+    const linked = engineLink(a);
+    try {
+      const entry = await copyToEngine(editor, a);
+      toast(linked ? `Updated the engine's ${entry.file}: projects using it update when they're open`
+        : `Copied to the engine as ${entry.file}: every project can use it, and this copy follows it`, { type: 'ok', timeout: 5000 });
+    } catch (err) {
+      toast(`Couldn't copy ${a.name} to the engine: ${err.message}`, { type: 'error', timeout: 6000 });
+    }
+  };
+  const confirmToEngine = (a) => modal('Update the engine copy', h('p', {},
+    `Replace the engine's ${engineLink(a).file} with this project's ${a.path}? Every project using it gets this version.`), {
+    actions: [{ label: 'Cancel', run: () => {} }, { label: 'Update engine copy', cls: 'btn-primary', run: () => { toEngine(a); } }],
+  });
   const importScriptFiles = async (dir) => {
     for (const f of await pickFiles('.js,.mjs', true)) {
       scripts.add({ path: uniquePath(dir, fileStem(f.name.replace(/\.m?js$/, '')), '.js', scripts.list().map((s) => s.path)), source: await f.text() });
@@ -188,12 +212,16 @@ export function explorer(root, editor, sync, actions) {
     };
     const modelRow = (a, depth) => {
       const n = modelUsage(a.id).length;
+      const link = engineLink(a);
       return row({
-        depth, icon: ICON.model, label: baseName(a.path), sub: n ? `×${n}` : formatBytes(a.buffer.byteLength), key: a.path,
-        title: `${a.path} · ${formatBytes(a.buffer.byteLength)}\nClick to place`,
+        depth, icon: ICON.model, label: baseName(a.path), sub: `${n ? `×${n}` : formatBytes(a.buffer.byteLength)}${link ? ' · ⚙' : ''}`, key: a.path,
+        title: `${a.path} · ${formatBytes(a.buffer.byteLength)}${link ? `\nFollows the engine's ${link.file}` : ''}\nClick to place`,
         onclick: () => placeModel(a),
         oncontextmenu: (e) => contextMenu(e.clientX, e.clientY, [
           ['Place', () => placeModel(a)],
+          '-',
+          link ? ['Update the engine copy from this file…', () => confirmToEngine(a)] : ['Copy to the engine (share with every project)', () => toEngine(a)],
+          link ? ['Unlink from the engine', () => { unlinkEngine(editor, a); toast(`${a.name} no longer follows the engine`); }] : null,
           '-',
           ['Rename…', () => renameModel(a)],
           ['Delete', () => deleteModel(a), { danger: true }],
@@ -215,10 +243,9 @@ export function explorer(root, editor, sync, actions) {
 
     walk(treeOf('scripts', scripts.list()), 0, scriptRow, scriptMenu, out);
     walk(treeOf('assets', assets.list()), 0, modelRow, modelMenu, out);
-    walk(treeOf('clips', clips.clips), 0, clipRow, clipMenu, out);
 
     // what the engine provides: used ones are copied into the project
-    out.push(row({ depth: 0, icon: open.has('engine') ? '▾' : '▸', label: 'Engine', cls: 'fx-folder fx-engine', title: 'Built into the editor: using one copies it into the project', onclick: () => { open.has('engine') ? open.delete('engine') : open.add('engine'); render(); } }));
+    out.push(row({ depth: 0, icon: open.has('engine') ? '▾' : '▸', label: 'Engine', cls: 'fx-folder fx-engine', title: 'Built into the editor, shared by every project: using one copies it into the project', onclick: () => { open.has('engine') ? open.delete('engine') : open.add('engine'); render(); } }));
     if (open.has('engine')) {
       const sub = (key, label) => row({ depth: 1, icon: open.has(key) ? '▾' : '▸', label, cls: 'fx-folder fx-engine', onclick: () => { open.has(key) ? open.delete(key) : open.add(key); render(); } });
       out.push(sub('engine/templates', 'Script templates'));
@@ -232,6 +259,31 @@ export function explorer(root, editor, sync, actions) {
           }));
         }
       }
+      out.push(sub('engine/models', 'Models'));
+      if (open.has('engine/models')) {
+        if (!engineList) {
+          out.push(row({ depth: 2, icon: '…', label: 'Loading…', cls: 'fx-engine-item' }));
+          engineCatalog().then((l) => { engineList = l; render(); }).catch((err) => { engineList = { error: err.message }; render(); });
+        } else if (engineList.error) {
+          out.push(row({ depth: 2, icon: '⚠', label: 'Engine models unavailable', title: engineList.error, cls: 'fx-engine-item' }));
+        } else if (!engineList.length) {
+          out.push(row({ depth: 2, icon: 'ℹ', label: 'None yet', title: 'Right-click a model in assets/ and pick "Copy to the engine", or put .glb files in the editor\'s engine/models/ folder', cls: 'fx-engine-item' }));
+        } else {
+          for (const item of engineList) {
+            const have = findEngineCopy(editor, item.file);
+            const role = item.meta?.tinyimgen?.role;
+            out.push(row({
+              depth: 2, icon: role === 'character' ? '🧍' : role === 'prop' ? '🗡' : ICON.model, label: item.name,
+              sub: have ? 'in project' : formatBytes(item.size), cls: 'fx-engine-item', key: `engine:${item.file}`,
+              title: `engine/models/${item.file}\n${have ? `In the project as ${have.path} (follows the engine)` : 'Click: copy into assets/ and place'}`,
+              onclick: () => useSharedModel(item),
+              oncontextmenu: (e) => contextMenu(e.clientX, e.clientY, [['Place', () => useSharedModel(item)]]),
+            }));
+          }
+        }
+      }
+      // the animation clip library lives in the engine (engine/clips/), shared by every project
+      walk(treeOf('clips', clips.clips), 1, clipRow, clipMenu, out);
       out.push(sub('engine/tinyimgen', 'tinyimgen models'));
       if (open.has('engine/tinyimgen')) {
         if (!tiny) {
@@ -298,6 +350,7 @@ export function explorer(root, editor, sync, actions) {
   target(document.getElementById('right'), () => [...editor.selection]);
 
   for (const lib of [scripts, assets, clips]) lib.addEventListener('changed', render);
+  engineEvents.addEventListener('changed', () => { engineCatalog().then((l) => { engineList = l; render(); }).catch(() => {}); });
   sync.addEventListener('changed', render);
   for (const ev of ['selectionChanged', 'sceneChanged', 'objectChanged']) editor.on(ev, render);
   render();

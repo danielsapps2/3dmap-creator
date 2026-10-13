@@ -7,7 +7,8 @@
 //     base: null | { fps, frames, rot: { bone: Float32Array(frames * 4) }, hips: Float32Array(frames * 3) | null },
 //     keys: { bone: [{ t, q: [x, y, z, w] }] },  // rotation offsets: final = offset * base
 //     hipKeys: [{ t, p: [x, y, z] }],            // Hips offset, added to the base's
-//     rest: { bone: [x, y, z] } | null }         // joint positions of the skeleton it was made for (see below)
+//     rest: { bone: [x, y, z] } | null,          // joint positions of the skeleton it was made for (see below)
+//     gait?: { speed, stride, sync, rate, duty, direction, leg } }  // a locomotion cycle (see gaitFor)
 //
 // Without a base the rest pose (identity) is the base, so keys are plain poses: that's a new clip made from scratch.
 // Hips positions are offsets from the rest position in units of the character's hip height, so a clip carries over
@@ -23,9 +24,6 @@ import { uid } from '../core/utils.js';
 import { fileStem, stemOf, dirName, uniquePath } from '../core/paths.js';
 
 export const FPS = 30;
-/** Clips with these names replace the character's own locomotion clip in the playtest. */
-export const LOCOMOTION = ['Idle', 'Walk', 'Run', 'WalkBackward', 'StrafeLeft', 'StrafeRight'];
-export const isLocomotion = (clip) => LOCOMOTION.includes(clip.name);
 
 export function createClip({ name = 'New clip', duration = 2, loop = true, source = 'new', base = null, rest = null } = {}) {
   return { id: uid(), name, loop, duration, interp: 'smooth', source, base, keys: {}, hipKeys: [], rest };
@@ -113,6 +111,8 @@ export function rigOf(model) {
 // ------------------------------------------------------------------ evaluation
 
 const _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _v = new THREE.Vector3();
+// hipsOffset's and applyPose's own: _v is the lerp scratch inside keyedHips/baseHips, so it can't be their `out`
+const _base = new THREE.Vector3(), _hips = new THREE.Vector3();
 
 /** Keys of a channel around time t: { k0, k1, k2, k3 } (times t0..t3, adjusted across a loop) and u in [0, 1]. */
 function around(keys, t, duration, loop) {
@@ -214,14 +214,14 @@ export function boneRotation(clip, bone, t, out = new THREE.Quaternion()) {
 
 /** Final Hips offset (hip heights) at time t. */
 export function hipsOffset(clip, t, out = new THREE.Vector3()) {
-  return keyedHips(clip, t, out).add(baseHips(clip, t, _v));
+  return keyedHips(clip, t, out).add(baseHips(clip, t, _base));
 }
 
 /** Pose a model (its rig, from rigOf) as the clip is at time t. */
 export function applyPose(clip, t, rig) {
   for (const [name, bone] of Object.entries(rig.bones)) boneRotation(clip, name, t, bone.quaternion);
-  hipsOffset(clip, t, _v);
-  rig.bones.Hips.position.copy(rig.restHips).addScaledVector(_v, rig.hipsHeight);
+  hipsOffset(clip, t, _hips);
+  rig.bones.Hips.position.copy(rig.restHips).addScaledVector(_hips, rig.hipsHeight);
 }
 
 // ------------------------------------------------------------------ to / from three.js clips
@@ -254,7 +254,33 @@ export function bakeClip(clip, rig) {
   return new THREE.AnimationClip(clip.name, clip.duration, tracks);
 }
 
-/** Import a model's own clip (a tinyimgen locomotion clip) as a library clip, with the motion as its base. */
+// ------------------------------------------------------------------ gait
+
+/** Leg length (hip joint to ankle, averaged over both legs) of joint positions ({ bone: Vector3 }). */
+export function legLength(pos) {
+  const side = (s) => pos[`${s}UpperLeg`] && pos[`${s}LowerLeg`] && pos[`${s}Foot`]
+    ? pos[`${s}UpperLeg`].distanceTo(pos[`${s}LowerLeg`]) + pos[`${s}LowerLeg`].distanceTo(pos[`${s}Foot`]) : 0;
+  const legs = [side('Left'), side('Right')].filter((l) => l > 0);
+  return legs.length ? legs.reduce((a, b) => a + b) / legs.length : 0;
+}
+
+/**
+ * A locomotion clip's gait for one rig: { speed (m/s), stride (m per cycle), sync, rate }, in the rig's own units.
+ * Clips store the gait of the character they were captured on with its leg length (`leg`); the same motion on
+ * longer legs covers more ground, so speed and stride scale with the leg. Null for clips without a gait.
+ */
+export function gaitFor(clip, rig) {
+  const g = clip.gait;
+  if (!g) return null;
+  const leg = rig ? legLength(restPositions(rig)) : 0;
+  const k = g.leg > 0 && leg > 0 ? leg / g.leg : 1;
+  return { speed: (g.speed ?? 0) * k, stride: (g.stride ?? 1) * k, sync: g.sync ?? 0, rate: g.rate ?? 1 };
+}
+
+/**
+ * Import a model's own clip as a library clip, with the motion as its base. A tinyimgen locomotion clip keeps its
+ * gait (speed, stride, phase sync from the GLB's animation extras), measured against this rig's leg length.
+ */
 export function clipFromThree(threeClip, rig, { source = `character:${threeClip.name}`, loop = true } = {}) {
   const byNode = new Map();
   for (const track of threeClip.tracks) {
@@ -284,14 +310,23 @@ export function clipFromThree(threeClip, rig, { source = `character:${threeClip.
       _v.fromArray(interp.evaluate(Math.min(i / FPS, duration))).sub(rig.restHips).divideScalar(rig.hipsHeight).toArray(hips, i * 3);
     }
   }
-  return createClip({ name: threeClip.name, duration, loop, source, base: { fps: FPS, frames, rot, hips }, rest: restArrays(restPositions(rig)) });
+  const clip = createClip({ name: threeClip.name, duration, loop, source, base: { fps: FPS, frames, rot, hips }, rest: restArrays(restPositions(rig)) });
+  const ex = threeClip.userData ?? {};
+  if (typeof ex.speed === 'number') {
+    clip.gait = {
+      speed: ex.speed, stride: ex.stride ?? 0, sync: ex.sync ?? 0, rate: ex.rate ?? 1, duty: ex.duty ?? null,
+      direction: ex.direction ?? null, leg: +legLength(restPositions(rig)).toFixed(5),
+    };
+  }
+  return clip;
 }
 
 // ------------------------------------------------------------------ library
 
 /**
- * The shared clip library: one list of clips for every tinyimgen character. It lives in the browser (IndexedDB),
- * travels inside saved projects, and the playtest gets a copy on ▶ Play. Emits 'changed'.
+ * The clip library: one list of clips for every tinyimgen character, kept in the engine (engine/clips/, see
+ * editor/EngineClips.js) rather than in projects, so every project uses the same clips. The playtest gets a copy on
+ * ▶ Play and exported maps carry it. Emits 'changed'.
  */
 export class ClipLibrary extends EventTarget {
   constructor() {
@@ -342,9 +377,6 @@ export class ClipLibrary extends EventTarget {
     for (let i = 2; ; i++) if (!taken.has(`${stem} ${i}`)) return `${stem} ${i}`;
   }
 
-  /** Clips the playtest plays on the number keys: everything that isn't a locomotion clip, in library order. */
-  actions() { return this.clips.filter((c) => !isLocomotion(c)).slice(0, 9); }
-
   toJSON() { return this.clips; }
 
   /** Replace the library (null/undefined: keep it). */
@@ -354,7 +386,23 @@ export class ClipLibrary extends EventTarget {
     this.changed();
   }
 
-  /** Add or replace clips by id (a project's clips joining the library). Returns how many came in. */
+  /**
+   * Add the clips the library doesn't have (by id), e.g. an older project's own clips joining the engine's. The
+   * library's version wins over a project's. Returns the clips added.
+   */
+  addMissing(list) {
+    const added = [];
+    for (const clip of (Array.isArray(list) ? list : []).filter(validClip)) {
+      if (this.get(clip.id)) continue;
+      const c = { ...clip, path: null, name: this.uniqueName(clip.name) };
+      this.clips.push(c);
+      added.push(c);
+    }
+    if (added.length) this.changed();
+    return added;
+  }
+
+  /** Add or replace clips by id. Returns how many came in. */
   merge(list) {
     let n = 0;
     for (const clip of (Array.isArray(list) ? list : []).filter(validClip)) {

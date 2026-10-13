@@ -89,7 +89,7 @@ The prop becomes a child of the character attached to its `RightHand_Socket` or 
   
   These edits apply to that copy only, on top of the prop's `grip.json`. **Reset to saved grip** drops them.
 - **Camera:** start in first or third person, facing mode, third-person distance, eye height.
-- **Movement:** walk and run speed (first person; in third person the character moves at its animation speed), jump speed, gravity, step height, max slope, collision radius and height.
+- **Movement:** walk and run speed (m/s, in both views: in third person the walk and run clips play faster or slower to match, so the feet stay planted), jump speed, gravity, step height, max slope, collision radius and height.
 
 You can also drag a character onto the spawn in the Scene list. ▶ Play uses the spawn's character as the player: it plays the character's own GLB with tinyimgen's locomotion, holding everything it holds in the editor. It is preselected on the pause card, and you can still pick another character there. The spawn's settings are exported in its `userData.params`.
 
@@ -113,22 +113,39 @@ My map/
   project.json                the map: environment, objects (with their scripts' params), camera, settings, and an index of the files
   scripts/**/Door.js          one file per script (subfolders are fine)
   assets/**/knight.glb        the models
-  clips/**/Wave.clip.json     one file per animation clip
   terrain/heights.f32, terrain/colors.f32   the terrain grid (raw Float32)
 ```
 
-**File → Save project** (`Ctrl+S`) picks the folder the first time, and **Open project folder…** (`Ctrl+O`) opens one. From then on, scripts, models and clips are **written as soon as they change**: a new or renamed script, an imported model, an edited clip. `Ctrl+S` saves the map itself (`project.json` and the terrain). Without a folder, the same files live in the editor (and its autosave) until the first save.
+**File → Save project** (`Ctrl+S`) picks the folder the first time, and **Open project folder…** (`Ctrl+O`) opens one. From then on, scripts and models are **written as soon as they change**: a new or renamed script, an imported model. Animation clips aren't part of the project: they live in the engine (see [Engine clips](#engine-clips-shared-by-every-project)). `Ctrl+S` saves the map itself (`project.json` and the terrain). Without a folder, the same files live in the editor (and its autosave) until the first save.
 
 The **Files** tab shows them:
 
 - **scripts/**: double-click to edit. Drag a script onto an object in the viewport, a row in the Scene list, or the Inspector to attach it. Right-click for New, New from template, Import .js, Rename, Duplicate or Delete.
 - **assets/**: click a model to place it. Right-click to import, rename or delete (deleting also removes its placed copies).
-- **clips/**: double-click to open in the animation editor. Right-click to rename, duplicate or delete.
+- **Engine → clips/**: the engine's animation clips. Double-click to open in the animation editor. Right-click to rename, duplicate or delete.
 - **Engine**: what the editor provides, which is the script templates and the tinyimgen models. Using one copies it into the project: clicking or dragging a template writes `scripts/<Template>.js` (the Inspector's **+ Add script…** offers them too), and clicking a tinyimgen model writes it to `assets/` and places it.
 
-The editor watches the folder while it's open. Scripts and clips saved, added (including in subfolders) or deleted outside the editor show up, and a GLB dropped into `assets/` becomes a model (replacing one updates its placed copies). A script you save in VS Code reloads the running game. Writes never overwrite a file that changed on disk unless the editor changed it too, and if both changed you're told. If `project.json` changes on disk, the editor offers to reload the project. After a page reload the editor reconnects to the folder (the browser may ask again) and takes script edits made while it was closed. The status bar shows the open folder.
+#### Engine models (shared by every project)
 
-The single-file format (`.map.json`, everything embedded) is still under **File → Open / Save as single file**, and it's what other browsers use. Folders saved with the older `clips.json` still open.
+Models you use in many projects live once in the editor's `engine/models/` folder (one `.glb`/`.gltf` each, plus a `<name>.meta.json` with its tinyimgen link and prop grip). They're listed under **Engine → Models** in the Files tab and in the Models tab. Clicking one copies it into the project's `assets/` and places it.
+
+A project's copy stays **linked** to the engine file (⚙ next to it in `assets/`). When the engine file changes, every open project reloads it, including its placed copies, writes the new version to its `assets/`, and reloads an open playtest. A project opened later catches up straight away. Project models that are byte-for-byte the same as an engine model are linked automatically, so copies made before the model was in the engine follow it too.
+
+- To **change a shared model**, edit or replace the file in `engine/models/` (Blender, a re-export, anything), or right-click a linked model in `assets/` → **Update the engine copy from this file…**
+- To **share a project model**, right-click it in `assets/` → **Copy to the engine**.
+- **Unlink from the engine** keeps the project's copy as it is.
+
+The library is served by the dev and preview servers (`npm run dev`, `npm run preview`); set `ENGINE_DIR` to use another folder than `engine/`.
+
+#### Engine clips (shared by every project)
+
+The animation clip library lives in the engine too, in `engine/clips/` (one `<name>.clip.json` per clip), not in projects. The animation editor and the Files tab (**Engine → clips/**) edit it, changes are written straight away, and clip files changed on disk (or by another editor tab) come in while the editor is open. ▶ Play hands the library to the playtest, and exported maps with characters carry it.
+
+tinyimgen's built-in locomotion is in the library as ordinary clips: **Walk**, **Run**, **WalkBackward**, **StrafeLeft** and **StrafeRight** (from the Mechanic's mocap), plus **Idle**. They have nothing special about their names. Each keeps its *gait* (speed, stride and phase sync, measured against the leg length of the character it came from), and on another character the gait is fitted to that character's legs, so the feet stay planted on any tinyimgen body. The animation editor marks these clips **gait**. Importing a character's own clip (**Character clips ▾**) keeps its gait.
+
+The editor watches the folder while it's open. Scripts saved, added (including in subfolders) or deleted outside the editor show up, and a GLB dropped into `assets/` becomes a model (replacing one updates its placed copies). A script you save in VS Code reloads the running game. Writes never overwrite a file that changed on disk unless the editor changed it too, and if both changed you're told. If `project.json` changes on disk, the editor offers to reload the project. After a page reload the editor reconnects to the folder (the browser may ask again) and takes script edits made while it was closed. The status bar shows the open folder.
+
+The single-file format (`.map.json`, everything embedded) is still under **File → Open / Save as single file**, and it's what other browsers use. Projects saved with their own `clips/` (or the older `clips.json`) still open: the clips the engine doesn't have yet are added to it, and the engine's own versions win. The project's clip files are left as they are.
 
 ### Scripts
 
@@ -148,7 +165,7 @@ export default class Spin {
 }
 ```
 
-Each instance has `this.object` (its node in the loaded map), `this.params`, `this.THREE`, and `this.game`: `time`, `player` (`position`, `teleport()`, `playClip(name)` for animation library clips), `find(name)`, `findByTag(tag)`, `message(text)`, `input.isDown(code)` / `input.pressed(code)`, `on(event, fn)` / `emit(event, data)` (a Trigger Volume's event name fires when the player enters it), `destroy(object)`, `setCollidable(object, on)` and `distanceToPlayer(object)`. Colliders follow objects that scripts move. Scripts can't `import`.
+Each instance has `this.object` (its node in the loaded map), `this.params`, `this.THREE`, and `this.game`: `time`, `player` (`position`, `teleport()`, `playClip(name)` for animation library clips, `locomotion({ idle, walk, … })` to walk with library clips), `find(name)`, `findByTag(tag)`, `message(text)`, `input.isDown(code)` / `input.pressed(code)`, `on(event, fn)` / `emit(event, data)` (a Trigger Volume's event name fires when the player enters it), `destroy(object)`, `setCollidable(object, on)` and `distanceToPlayer(object)`. Colliders follow objects that scripts move. Scripts can't `import`.
 
 Scripts run in the playtest, and saving one reloads an open playtest tab. A script that throws is stopped and reported on screen, and the others keep running. They're saved in the project and exported inside the map GLB, so your game can run them with the drop-in `src/runtime/scripts.js` (next to `MapLoader.js`):
 
@@ -163,7 +180,7 @@ Scripts are code that runs in the page with full access to it, so only run maps 
 
 #### Animation states
 
-Any tinyimgen character in the map can be animated from a script. It can play clips from the animation library, which is exported inside the map, as well as the characters' own Idle, Walk and Run. A `clip` param shows up in the Inspector as a dropdown of those clips.
+Any tinyimgen character in the map can be animated from a script. It can play clips from the animation library (the engine's clips), which is exported inside the map. A `clip` param shows up in the Inspector as a dropdown of those clips.
 
 ```js
 const anim = this.game.animator(this.object);              // null if it isn't a tinyimgen character
@@ -187,16 +204,28 @@ A state can have `clip`, `loop`, `fade` and `speed`. It can also have `enter(sm,
 
 How the player moves is a script too, and its params are the movement and camera settings. In the Player Spawn's Inspector, **Make a player controller script** turns the built-in controller into this map's own script. The spawn's current settings carry over, and the spawn's Movement and Camera fields give way to the script's. You can change the code freely: speeds, jumping, air control, the first-person and third-person cameras, mouse look, and the V / T / R / Space keys. It uses `this.game.physics.move(dt, { radius, height, step, maxSlope })` for collisions, plus `this.game.view`, `this.game.input.mouse` and `this.game.player`.
 
+The controller also picks the character's movement animation. Its **Idle / Walk / Run / Walk back / Strafe left / Strafe right clip** fields are library clips, and it hands them over when it starts and whenever the character changes:
+
+```js
+this.game.player.locomotion(
+  { idle: 'Idle', walk: 'Walk', run: 'Run', back: 'WalkBackward', left: 'StrafeLeft', right: 'StrafeRight' },
+  { walk: p.walkSpeed, run: p.runSpeed },   // m/s
+  { idle: 1, walk: 1.2 },                    // each clip's playback speed (×), optional
+);
+```
+
+They're blended by the character's velocity like tinyimgen's own locomotion, with the feet planted, and the character moves at the controller's **Walk speed** and **Run speed**: the clips play faster or slower to match, with the same stride, so the feet stay planted (walking back and strafing scale with the walk). Leave the speeds out of `locomotion()` to move at the clips' own speed, fitted to the character's legs. Each clip also has a **clip speed (×)** field: idle plays that much faster or slower, and a moving clip takes quicker, shorter steps (or slower, longer ones) at the same movement speed, so anything but 1 slides the feet a little. A character can bring its own values for any of the controller's fields: a `controller` block in its model's meta (`engine/models/<name>.meta.json`), which the controller lays over its fields as `this.settings` when that character is picked. The engine's Mechanic and Dark Fantasy Soldier walk at 4 m/s and run at 6 m/s, with walk clip speed 0.4 and run clip speed 0.5. Idle and walk are required; leave run or the strafes empty to go without them. Nothing walks a tinyimgen character by default: if the controller doesn't call `locomotion()`, the character stays still and the playtest says so. Scripts can play the library clips the controller doesn't walk with (`this.game.player.playClip(name)`). In your own game, `src/runtime/clipLocomotion.js` does the same (`clipLocomotion(model, rig, clips, states, { rates })`).
+
 A script becomes the controller by exporting `controlsPlayer = true`. Maps without a controller, including older maps, run the default one (`src/runtime/PlayerController.script.js`) with the spawn's settings. If a controller crashes, the default takes over, so the player can still move.
 
 ### Animation editor (🎬 Animate)
 
-A keyframe editor for tinyimgen characters. Every tinyimgen rig has the same skeleton with unrotated rest joints, so a clip made on one character plays on all of them. Each clip remembers the skeleton it was made on, and on another character it's fitted to that body's proportions (bone by bone, lining up the rest directions), so arms and legs land where they should. In the game, characters use their own Idle, Walk and Run unless the library has a clip by that name. Clips live in one shared library: it's kept in the browser, saved inside project files (opening a project adds its clips), and handed to the playtest by ▶ Play.
+A keyframe editor for tinyimgen characters. Every tinyimgen rig has the same skeleton with unrotated rest joints, so a clip made on one character plays on all of them. Each clip remembers the skeleton it was made on, and on another character it's fitted to that body's proportions (bone by bone, lining up the rest directions), so arms and legs land where they should. Clips live in one library in the engine (`engine/clips/`, see [Engine clips](#engine-clips-shared-by-every-project)), shared by every project, and ▶ Play hands it to the playtest. Characters don't walk with their own clips: the player controller picks library clips for that.
 
 - **Clips:** start an empty clip (from the rest pose) or one from the pose on screen, import one of the preview character's own clips (its mocap Idle, Walk, Run…), or import from [Mesh2Motion](https://github.com/Mesh2Motion/mesh2motion-app)'s 178 free (CC0) human animations, retargeted to tinyimgen's skeleton. An imported clip's motion becomes its *base*, and your keys are corrections on top of it.
 - **Posing:** click a joint, then rotate it with the gizmo (`E`) or type the angles. The hips can also be moved (`W`). Posing keys the current frame. `K` keys the selected bone, `Shift+K` the whole pose, `M` mirrors the pose left to right, and `Ctrl+C` / `Ctrl+V` copy and paste poses.
 - **Timeline:** scrub on the ruler, click keys to select them (`Shift` adds), drag them to retime, and `Delete` removes them. Keys are smoothed (Catmull-Rom) or linear, and looping clips wrap around. `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo.
-- **In the playtest:** clips named `Idle`, `Walk`, `Run`, `WalkBackward`, `StrafeLeft` or `StrafeRight` replace the character's own clip of that name. The rest play on keys `1`–`9` in library order: the character stands still while one plays, a one-shot fades out at its end, and a loop runs until you move or press its key again. Closing the editor with changes reloads an open playtest tab.
+- **In the playtest:** the player controller's clips move the character. Scripts play the rest with `this.game.player.playClip(name)`: the character stands still while one plays, a one-shot fades out at its end, and a loop runs until the character moves or the script plays it again. Closing the editor with changes reloads an open playtest tab.
 
 ### Play mode
 
@@ -210,10 +239,10 @@ The map starts playing as soon as it loads, with no "click to play" screen (only
 
 - **First or third person:** switch with `V` or on the pause card. In third person the mouse orbits the camera, the wheel zooms, and the camera pulls in instead of clipping through walls. `T` switches facing between *free turn* (the character turns toward where it walks) and *strafe* (it faces the camera; A/D strafe, S walks backwards).
 - **Character:** pick one on the pause card. Your choice is remembered. If the map has a character under its Player Spawn (see above), that one is used.
-  - **tinyimgen characters:** with tinyimgen running (`server.py`, port 7860), every model built with *Rig + animations* is listed with its thumbnail. They're driven by tinyimgen's locomotion runtime (`src/game/locomotion.js`, a copy of tinyimgen's `static/locomotion.js`), which blends Idle, Walk, Run, WalkBackward and the strafes by velocity, so the feet stay planted. The dev server proxies tinyimgen under `/tinyimgen` (set `TINYIMGEN_URL` to point elsewhere).
+  - **tinyimgen characters:** with tinyimgen running (`server.py`, port 7860), every model built with *Rig + animations* is listed with its thumbnail. They walk with the clips the player controller picks from the engine's library (`src/runtime/clipLocomotion.js`, on top of tinyimgen's locomotion runtime `src/game/locomotion.js`), blended by velocity so the feet stay planted. The dev server proxies tinyimgen under `/tinyimgen` (set `TINYIMGEN_URL` to point elsewhere).
   - **Any rigged .glb:** clips named like idle / walk / run are crossfaded by speed. Models in other units are rescaled to 1.8 m.
   - **Capsule:** a placeholder with no model.
-- Movement in third person comes from the animation (tinyimgen's walk is about 1.4 m/s and its jog about 2.9 m/s), while ramps, stairs, walls, gravity and jumping use the same physics as first person.
+- Movement in third person comes from the animation, at the controller's walk and run speeds (the engine's Walk is about 1.4 m/s and its Run about 2.8 m/s at their own pace), while ramps, stairs, walls, gravity and jumping use the same physics as first person.
 
 The playtest shows a performance overlay (toggle with `F3`): FPS, frame and CPU time, draw calls, triangles, and the GPU memory the page has allocated (textures, buffers, render targets, canvas), measured with [webgl-memory](https://github.com/greggman/webgl-memory). Browsers don't report total VRAM use, so this counts only what the page allocated.
 
@@ -267,7 +296,7 @@ Terrain vertices form a grid: `index = iz * (segments + 1) + ix`, `x = ix * size
 src/editor/   Editor core: Terrain, Primitives, Markers, Entities, AssetLibrary, History, Project, Export, Rig, Tinyimgen
 src/ui/       Panels, Inspector, DOM helpers
 src/core/     Shared helpers, including the tinyimgen client (tinyimgen.js)
-src/runtime/  MapLoader.js: drop-in loader for your game; scripts.js: runs the map's scripts; animator.js: clips + state machines for characters;
+src/runtime/  MapLoader.js: drop-in loader for your game; scripts.js: runs the map's scripts; animator.js: clips + state machines for characters; clipLocomotion.js: walking with library clips;
               PlayerController.script.js: the default player controller; hold.js + props.js: props held in a character's hand
 src/anim/     Animation editor: clip library + evaluation (clips.js), skeleton, Mesh2Motion retargeting, AnimEditor
 src/game/     First-person playtest demo (game.html)

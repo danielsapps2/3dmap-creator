@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
 import { fileURLToPath } from 'node:url';
+import { engineLibrary } from './server/engine.js';
 
 // The playtest lists rigged characters from a running tinyimgen server. Proxying it under /tinyimgen keeps it
 // same-origin (no CORS changes needed in tinyimgen). Override the address with TINYIMGEN_URL.
@@ -12,7 +13,9 @@ const tinyimgen = {
 };
 
 export default defineConfig({
-  server: { open: true, proxy: tinyimgen },
+  // The engine's shared models and animation clips (engine/), used by every project. Override the folder with ENGINE_DIR.
+  plugins: [engineLibrary(process.env.ENGINE_DIR ?? fileURLToPath(new URL('./engine', import.meta.url)))],
+  server: { open: true, proxy: tinyimgen, watch: { ignored: ['**/engine/**'] } },
   preview: { proxy: tinyimgen },
   build: {
     chunkSizeWarningLimit: 1500,

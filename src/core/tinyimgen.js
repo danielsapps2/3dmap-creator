@@ -47,7 +47,7 @@ export const propFiles = (id) => ({ url: `${TINYIMGEN}/media/3d/${id}/prop.glb`,
 /** Download a file from tinyimgen, revalidating so a re-rig or re-saved grip shows up. */
 export async function fetchTinyimgen(url, as = 'arrayBuffer') {
   const res = await fetch(url, { cache: 'no-cache' });
-  if (!res.ok) throw new Error(`Couldn't download ${url.split('/').pop()} from tinyimgen (HTTP ${res.status})`);
+  if (!res.ok) throw Object.assign(new Error(`Couldn't download ${url.split('/').pop()} from tinyimgen (HTTP ${res.status})`), { status: res.status });
   return res[as]();
 }
 

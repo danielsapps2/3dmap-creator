@@ -3,15 +3,20 @@
 // Every character exposes the same animator interface as tinyimgen's Locomotion:
 //   update(dt, input, running) -> local velocity { x: left, z: forward, speed } in m/s
 // so movement speed always comes from the animation (feet stay planted) and the game only adds physics.
+//
+// A tinyimgen character has no animation of its own here: the player controller script picks library clips for
+// idle, walk, run, backwards and strafing (useLocomotion, from game.player.locomotion). Other GLBs play their own
+// Idle / Walk / Run clips by name, since library clips only fit tinyimgen's skeleton.
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
-import { Locomotion } from './locomotion.js';
 import { fetchTinyimgen } from '../core/tinyimgen.js';
+import { fetchEngineModel } from '../core/engine.js';
 import { heldProp, poseHeld, findNamed } from '../runtime/hold.js';
-import { rigOf, bakeClip, isLocomotion, sampleLocal, hipsOffset } from '../anim/clips.js';
+import { rigOf, sampleLocal, hipsOffset } from '../anim/clips.js';
+import { clipLocomotion, locomotionClipNames } from '../runtime/clipLocomotion.js';
 
 const DEFAULT_HEIGHT = 1.8;
 const ACTION_FADE = 0.2; // s to blend into and out of a library clip
@@ -31,17 +36,16 @@ function getLoader(renderer) {
 }
 
 /**
- * spec: { kind: 'capsule' } | { kind: 'tinyimgen', id, name, url } | { kind: 'file', name, buffer }
- * clips: the editor's animation library (anim/clips.js). On a tinyimgen skeleton, clips named like a locomotion
- * clip (Walk, Idle…) replace the model's own, and the rest become actions (playAction) for the number keys.
+ * spec: { kind: 'capsule' } | { kind: 'engine', file, name } | { kind: 'tinyimgen', id, name, url } | { kind: 'file', name, buffer }
+ * clips: the animation library (anim/clips.js). A tinyimgen character walks with the clips the player controller
+ * picks from it (useLocomotion); the library's other clips are actions (playAction) that scripts play (player.playClip).
  * Returns a Character whose `root` has its feet at the origin, facing +Z.
  */
 export async function loadCharacter(spec, renderer, { clips = null } = {}) {
   if (spec.kind === 'capsule') return new Character(makeCapsule(), new SimpleAnimator(), { name: 'Capsule', kind: 'capsule' });
   let buffer = spec.buffer;
-  if (spec.kind === 'tinyimgen') {
-    buffer = await fetchTinyimgen(spec.url);
-  }
+  if (spec.kind === 'engine') buffer = await fetchEngineModel(spec.file); // a character in the engine's models
+  else if (spec.kind === 'tinyimgen') buffer = await fetchTinyimgen(spec.url);
   const gltf = await getLoader(renderer).parseAsync(buffer, '');
   const model = gltf.scene;
   model.traverse((o) => {
@@ -50,27 +54,18 @@ export async function loadCharacter(spec, renderer, { clips = null } = {}) {
       if (o.isSkinnedMesh) o.frustumCulled = false; // bind-pose bounds don't follow the animation
     }
   });
-  const rig = clips?.length ? rigOf(model) : null; // read before anything poses it
-  if (rig) {
-    for (const clip of clips.filter(isLocomotion)) {
-      const baked = bakeClip(clip, rig), i = gltf.animations.findIndex((a) => a.name === clip.name);
-      if (i >= 0) gltf.animations[i] = baked; else gltf.animations.push(baked);
-    }
-  }
+  const rig = rigOf(model); // a tinyimgen skeleton (read before anything poses it), or null
   const scale = normalize(model);
-  let animator, kind;
-  try {
-    animator = new Locomotion(gltf); // tinyimgen rig: mocap clips with speed/stride extras
-    kind = 'locomotion';
-  } catch {
+  let animator = null, kind = 'rig'; // a tinyimgen character waits for the controller's clips
+  if (!rig) {
     animator = new SimpleAnimator(gltf.animations, model);
     kind = gltf.animations.length ? 'clips' : 'static';
   }
   const character = new Character(model, animator, { name: spec.name, kind, speedScale: scale });
   if (rig) {
     character.rig = rig;
-    character.actions = clips.filter((c) => !isLocomotion(c)).slice(0, 9);
-    character.libraryClips = clips.length;
+    character.library = clips ?? [];
+    character.actions = character.library;
   }
   return character;
 }
@@ -114,13 +109,63 @@ export class Character {
     this.borrowed = new Set();  // meshes copied from the map: their geometry/materials belong to the map
     this.animator = animator;
     this.name = name;
-    this.kind = kind; // 'locomotion' | 'clips' | 'static' | 'capsule'
+    this.kind = kind; // 'locomotion' (clips picked) | 'rig' (none yet) | 'clips' | 'static' | 'capsule'
     this.speedScale = speedScale;
     this.height = new THREE.Box3().setFromObject(this.root).getSize(new THREE.Vector3()).y || DEFAULT_HEIGHT;
     this.rig = null;        // tinyimgen skeleton (anim/clips.js rigOf), when library clips apply
-    this.actions = [];      // library clips on the number keys
-    this.libraryClips = 0;
+    this.library = [];      // the animation library's clips
+    this.states = null;     // the clip per movement state, once the controller picked them ({ idle, walk, … })
+    this.actions = [];      // library clips scripts can play (playAction)
     this.acting = null;     // the action playing: { clip, time, weight, ending }
+    this.unanimated = false; // a tinyimgen character was asked to move before the controller picked its clips
+    this.speeds = null;     // { walk, run } in m/s, when the controller sets them (setSpeeds)
+    this.settings = {};     // player controller fields this character plays with (its model meta's `controller`)
+  }
+
+  /**
+   * Move at these speeds (m/s; walk also sets walking backwards and strafing, in proportion) instead of the clips'
+   * own. The walk and run clips play faster or slower to match: same stride, quicker or slower steps, so the feet
+   * stay planted. Null or 0 keeps a clip's own speed.
+   */
+  setSpeeds({ walk = 0, run = 0 } = {}) {
+    this.speeds = { walk, run };
+    const a = this.animator;
+    if (!a) return;
+    if (!a.setRate) { // other GLBs and the capsule: their game-feel speeds
+      if (walk > 0) a.walk = walk / this.speedScale;
+      if (run > 0) a.run = run / this.speedScale;
+      return;
+    }
+    const rate = (name, target) => {
+      const c = a.clips[name];
+      if (c?.speed > 0) a.setRate(name, target > 0 ? c.baked * (target / this.speedScale) / c.speed : c.baked);
+    };
+    const k = walk > 0 && a.clips.Walk?.speed > 0 ? walk / this.speedScale / a.clips.Walk.speed : 0;
+    rate('Walk', walk);
+    for (const name of ['WalkBackward', 'StrafeLeft', 'StrafeRight']) {
+      const c = a.clips[name];
+      if (c?.speed > 0) a.setRate(name, c.baked * (k || 1));
+    }
+    rate('Run', run);
+  }
+
+  /**
+   * Walk with library clips: states { idle, walk, run, back, left, right } name a clip each (idle and walk needed).
+   * rates { idle, walk, … } play a state's clip faster or slower (× 1; see clipLocomotion). The rest of the library
+   * can be played as actions (playAction). Other characters keep their own clips; returns the animator.
+   */
+  useLocomotion(states, rates) {
+    if (!this.rig) return this.animator;
+    const next = clipLocomotion(this.model, this.rig, this.library, states, { rates });
+    this.animator?.mixer?.stopAllAction();
+    this.animator = next;
+    this.kind = 'locomotion';
+    this.states = { ...states };
+    this.unanimated = false;
+    if (this.speeds) this.setSpeeds(this.speeds); // new clips, same speeds
+    const used = new Set(locomotionClipNames(states));
+    this.actions = this.library.filter((c) => !used.has(c.name));
+    return next;
   }
 
   /**
@@ -156,6 +201,7 @@ export class Character {
     this.root.scale.multiplyScalar(k);
     this.height = height;
     this.speedScale *= k;
+    if (this.speeds) this.setSpeeds(this.speeds); // set speeds are in m/s, whatever the size
   }
 
   /**
@@ -179,16 +225,18 @@ export class Character {
   update(dt, input, running) {
     const act = this.acting;
     if (act?.clip.loop && !act.ending && (input.x || input.z)) act.ending = true; // walking off ends a looping clip
-    const v = this.animator.update(dt, act && !act.ending ? STILL : input, running);
+    let v = STILL;
+    if (this.animator) v = this.animator.update(dt, act && !act.ending ? STILL : input, running);
+    else this.unanimated = true; // stands in its rest pose: nothing to walk with
     if (this.acting) this._blendAction(dt);
     // carry poses are in character heights, measured in the model's own units; during an action the clip has the arms
     const arms = !this.acting || this.acting.weight < 0.5;
     for (const held of this.held) poseHeld(this.model, held, this.height / this.speedScale, { arms });
-    return { x: v.x * this.speedScale, z: v.z * this.speedScale, speed: v.speed * this.speedScale };
+    return { x: v.x * this.speedScale, z: v.z * this.speedScale, speed: (v.speed ?? 0) * this.speedScale };
   }
 
   dispose() {
-    this.animator.mixer?.stopAllAction();
+    this.animator?.mixer?.stopAllAction();
     this.root.traverse((o) => {
       if (!o.isMesh || this.borrowed.has(o)) return;
       o.geometry.dispose();

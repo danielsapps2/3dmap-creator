@@ -25,20 +25,32 @@ export async function importTinyimgen(editor, item) {
 /**
  * Keep the library's tinyimgen props in step with the Prop Editor: check each prop's grip.json every couple of
  * seconds (and when the tab comes back into view), and when a save changed it, load the new prop.glb + grip into the
- * library and every placed copy. onUpdate(asset, placedCount) runs after each one.
+ * library and every placed copy. onUpdate(asset, placedCount) runs after each one. While tinyimgen is down the checks
+ * back off (5s, doubling to a minute) so the dev server's log isn't flooded with proxy errors.
  */
 export function watchTinyimgenProps(editor, { interval = 2000, onUpdate } = {}) {
   let busy = false;
-  const check = async () => {
-    if (busy) return;
+  let backoff = 0; // ms between checks while tinyimgen is unreachable; 0 when it's up
+  let nextCheck = 0;
+  const check = async ({ force = false } = {}) => {
+    if (busy || (!force && Date.now() < nextCheck)) return;
     busy = true;
     try {
       for (const asset of editor.assets.list()) {
         const src = asset.meta.tinyimgen;
         if (src?.role !== 'prop') continue;
         const { url, gripUrl } = propFiles(src.id);
-        const grip = await fetchTinyimgen(gripUrl, 'json').catch(() => null); // offline, or the job was deleted
-        if (!grip || JSON.stringify(grip) === JSON.stringify(asset.meta.grip ?? null)) continue;
+        let grip;
+        try {
+          grip = await fetchTinyimgen(gripUrl, 'json');
+        } catch (err) {
+          if (err.status < 500) continue; // the job was deleted; the other props can still sync
+          backoff = Math.min(backoff ? backoff * 2 : 5000, 60000); // tinyimgen is down (the proxy answers 502)
+          nextCheck = Date.now() + backoff;
+          return;
+        }
+        backoff = 0;
+        if (JSON.stringify(grip) === JSON.stringify(asset.meta.grip ?? null)) continue;
         // grip.json is written just before prop.glb is rebuilt from it; give the rebuild a moment to land
         await new Promise((r) => setTimeout(r, 400));
         const buffer = await fetchTinyimgen(url).catch(() => null);
@@ -53,6 +65,8 @@ export function watchTinyimgenProps(editor, { interval = 2000, onUpdate } = {}) 
     }
   };
   const timer = setInterval(check, interval);
-  document.addEventListener('visibilitychange', check);
-  return () => { clearInterval(timer); document.removeEventListener('visibilitychange', check); };
+  // Coming back to the tab (e.g. after starting tinyimgen or saving in its Prop Editor) checks straight away.
+  const onVisible = () => { if (!document.hidden) check({ force: true }); };
+  document.addEventListener('visibilitychange', onVisible);
+  return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisible); };
 }

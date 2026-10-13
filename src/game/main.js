@@ -5,8 +5,10 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 import { parseMap, applyEnvironment } from '../runtime/MapLoader.js';
 import { idbGet, idbSet } from '../core/storage.js';
 import { runScripts } from '../runtime/scripts.js';
+import { decodeClips } from '../runtime/animator.js';
 import { loadCharacter } from './Character.js';
 import { listTinyimgenCharacters } from '../core/tinyimgen.js';
+import { listEngineModels } from '../core/engine.js';
 import CONTROLLER_SOURCE from '../runtime/PlayerController.script.js?raw';
 
 const $ = (id) => document.getElementById(id);
@@ -61,7 +63,7 @@ let cameraBlockers = []; // meshes the third-person camera can't pass through (e
 let cameraCapsules = []; // characters: the camera tests their capsule, not their skinned mesh (~50 ms per ray)
 let envObjects = [];
 let solids = [];
-let mapPlayer = null; // the character under the map's Player Spawn: { node, spawn, name, buffer, parts } (see findMapPlayer)
+let mapPlayer = null; // the character under the map's Player Spawn: { node, spawn, name, buffer, controller, parts } (see findMapPlayer)
 let playerSpawn = null;
 const insideTriggers = new Set();
 
@@ -131,7 +133,21 @@ const scriptHost = {
     get spawn() { return playerSpawn; },
     respawn: () => respawn(),
     teleport(x, y, z) { player.pos.set(x, y, z); player.vel.set(0, 0, 0); },
-    /** Play a clip from the editor's animation library on the player character (by name). */
+    /**
+     * Walk with library clips: { idle, walk, run, back, left, right } name a clip each (idle and walk needed). The
+     * player controller calls this when it starts and on 'characterChanged'; until then a tinyimgen character has
+     * no walking animation. speeds: { walk, run } in m/s (the clips play faster or slower to match; omit them for
+     * the clips' own speeds). rates: { idle, walk, … } each clip's playback speed (× 1: quicker or slower steps at
+     * the same movement speed). Returns the animator, or null without a character.
+     */
+    locomotion(states, speeds, rates) {
+      if (!character) return null;
+      const animator = character.useLocomotion(states, rates);
+      if (speeds) character.setSpeeds(speeds);
+      setCharMsg(describeCharacter(character));
+      return animator;
+    },
+    /** Play a clip from the animation library on the player character (by name). */
     playClip(name) {
       const i = character?.actions.findIndex((c) => c.name === name) ?? -1;
       return i >= 0 && !!character.playAction(i);
@@ -197,7 +213,7 @@ async function findMapPlayer(map, playtest) {
   if (!node) return null;
   node.visible = false;
   const playable = rec && spawn;
-  return { node, spawn, name: playable ? rec.name : null, buffer: playable ? rec.buffer : null, height: playable ? rec.height : null, parts: map.childrenOf(node) };
+  return { node, spawn, name: playable ? rec.name : null, buffer: playable ? rec.buffer : null, height: playable ? rec.height : null, controller: playable ? rec.controller : null, parts: map.childrenOf(node) };
 }
 
 function respawn() {
@@ -254,11 +270,6 @@ function resolveWalls(p, prev) {
 const keys = new Set();
 window.addEventListener('keydown', (e) => {
   keys.add(e.code);
-  const digit = /^Digit([1-9])$/.exec(e.code);
-  if (digit && !e.repeat && character?.actions.length) {
-    const clip = character.playAction(+digit[1] - 1);
-    if (clip) flash(`${digit[1]} · ${clip.name}`);
-  }
   if (e.code === 'KeyE' && !e.repeat && interactFocus && scripts) scripts.interact(interactFocus.node);
   // in the editor: Esc with the mouse free (the first Esc frees it), or Ctrl+P, stops playing
   if (embedded && ((e.code === 'Escape' && !controls.isLocked) || ((e.ctrlKey || e.metaKey) && e.code === 'KeyP'))) {
@@ -302,6 +313,10 @@ function update(dt) {
   if (!map) return;
   const active = gameHasInput();
   scripts?.update(dt); // the player controller script moves the player and the camera
+  if (character?.unanimated && !unanimatedShown) {
+    unanimatedShown = true;
+    flash('The player controller hasn\'t picked walking clips: call this.game.player.locomotion({ idle, walk, … }) (see the Player controller template)', 8000, true);
+  }
   const p = player.pos;
   $('pos').textContent = `x ${p.x.toFixed(1)}  y ${p.y.toFixed(1)}  z ${p.z.toFixed(1)}`;
 
@@ -330,6 +345,7 @@ function update(dt) {
 
 const view = { mode: readPref('view', 'first'), facing: readPref('facing', 'free') };
 let character = null;
+let unanimatedShown = false; // told the player once that the controller didn't pick walking clips
 const camRay = new THREE.Raycaster();
 
 /** Distance along the ray before it hits map geometry or the terrain (up to maxDist). */
@@ -382,13 +398,18 @@ function writePref(key, value) {
   try { localStorage.setItem(`playtest.${key}`, value); } catch { /* private mode */ }
 }
 
-/** The editor's animation clip library, handed over by ▶ Play (null outside a playtest). Re-read on reload. */
+/**
+ * The animation clip library: the editor's (the engine's clips), handed over by ▶ Play, else the one exported in the
+ * map. Re-read on reload.
+ */
 let clipsPromise = null;
 const playtestClips = () => (clipsPromise ??= new URLSearchParams(location.search).has('playtest')
   ? idbGet('playtest-clips').catch(() => null) : Promise.resolve(null));
+const libraryClips = async () => (await playtestClips()) ?? decodeClips(map?.root.userData.clips);
 
 let charSpec = { kind: 'capsule' };
 let tinyChars = [];
+let engineChars = []; // characters among the engine's models: [{ file, name, tinyimgenId, controller }]
 let fileChar = null; // { name, buffer } of a .glb picked from disk
 let charLoadToken = 0;
 
@@ -398,10 +419,11 @@ async function selectCharacter(spec, { switchToThird = true } = {}) {
   renderCharacterTiles();
   setCharMsg(`Loading ${spec.name ?? 'character'}…`);
   try {
-    const clips = await playtestClips();
+    const clips = await libraryClips();
     const next = spec.kind === 'map'
       ? await loadCharacter({ kind: 'file', name: mapPlayer.name, buffer: mapPlayer.buffer }, renderer, { clips })
       : await loadCharacter(spec, renderer, { clips });
+    next.settings = controllerSettings(spec);
     if (spec.kind === 'map') {
       next.setHeight(mapPlayer.height);
       next.equip(mapPlayer.parts);
@@ -409,12 +431,13 @@ async function selectCharacter(spec, { switchToThird = true } = {}) {
     if (token !== charLoadToken) { next.dispose(); return; } // a newer pick won
     if (character) { scene.remove(character.root); character.dispose(); }
     character = next;
+    unanimatedShown = false;
     scene.add(character.root);
     const { kind, ...saved } = spec;
     if (kind !== 'map') writePref('character', JSON.stringify(kind === 'file' ? { kind, name: spec.name } : { kind, ...saved }));
     setCharMsg(describeCharacter(character));
-    renderActions();
     setView(spawnView ?? (switchToThird ? 'third' : view.mode));
+    scripts?.game.emit('characterChanged', { character }); // the controller picks its walking clips
   } catch (err) {
     if (token !== charLoadToken) return;
     console.error(err);
@@ -422,19 +445,20 @@ async function selectCharacter(spec, { switchToThird = true } = {}) {
   }
 }
 
-function describeCharacter(c) {
-  const anim = { locomotion: 'tinyimgen locomotion (6 mocap clips)', clips: 'idle/walk/run clips by name', static: 'no animations', capsule: 'no animations' }[c.kind];
-  const holds = c.held.length ? ` · holding ${c.held.map((h) => h.holder.userData.name ?? h.holder.name).join(', ')}` : '';
-  const lib = c.libraryClips ? ` · ${c.libraryClips} clip${c.libraryClips === 1 ? '' : 's'} from the editor` : '';
-  return `${c.name} · ${c.height.toFixed(2)} m · ${anim}${lib}${holds}`;
+/** The player controller fields a character plays with: its model meta's `controller` (an engine model's, or the map player's). */
+function controllerSettings(spec) {
+  const engine = spec.kind === 'engine' ? engineChars.find((c) => c.file === spec.file)
+    : spec.kind === 'tinyimgen' ? engineChars.find((c) => c.tinyimgenId === spec.id) : null;
+  return { ...(spec.kind === 'map' ? mapPlayer.controller : engine?.controller) };
 }
 
-/** The HUD's list of clips on the number keys. */
-function renderActions() {
-  const el = $('hud-actions');
-  const list = character?.actions ?? [];
-  el.hidden = !list.length;
-  el.replaceChildren(...list.flatMap((c, i) => [i ? ' · ' : '', Object.assign(document.createElement('kbd'), { textContent: i + 1 }), ` ${c.name}`]));
+function describeCharacter(c) {
+  const anim = {
+    locomotion: `walks with ${Object.values(c.states ?? {}).filter(Boolean).join(', ')}`,
+    rig: 'no walking clips picked yet', clips: 'its own idle/walk/run clips', static: 'no animations', capsule: 'no animations',
+  }[c.kind];
+  const holds = c.held.length ? ` · holding ${c.held.map((h) => h.holder.userData.name ?? h.holder.name).join(', ')}` : '';
+  return `${c.name} · ${c.height.toFixed(2)} m · ${anim}${holds}`;
 }
 
 function setCharMsg(text, error = false) {
@@ -461,7 +485,13 @@ function renderCharacterTiles() {
       selected: charSpec.kind === 'map', onClick: () => selectCharacter({ kind: 'map', name: mapPlayer.name }),
     })] : []),
     tile('Capsule', { icon: '⬮', selected: charSpec.kind === 'capsule', onClick: () => selectCharacter({ kind: 'capsule', name: 'Capsule' }) }),
-    ...tinyChars.map((c) => tile(c.name, {
+    ...engineChars.map((c) => tile(c.name, {
+      icon: '🧍', title: `${c.name} (engine/models/${c.file})`,
+      selected: charSpec.kind === 'engine' && charSpec.file === c.file,
+      onClick: () => selectCharacter({ kind: 'engine', file: c.file, name: c.name }),
+    })),
+    // tinyimgen's characters the engine doesn't have (the ones it has are played from the engine)
+    ...tinyChars.filter((c) => !engineChars.some((e) => e.tinyimgenId === c.id)).map((c) => tile(c.name, {
       thumb: c.thumb, title: `${c.name} (tinyimgen ${c.id})`,
       selected: charSpec.kind === 'tinyimgen' && charSpec.id === c.id,
       onClick: () => selectCharacter({ kind: 'tinyimgen', id: c.id, name: c.name, url: c.url }),
@@ -497,17 +527,32 @@ async function initCharacters() {
   try { saved = JSON.parse(readPref('character', 'null')); } catch { /* ignore */ }
   fileChar = await idbGet('playtest-character-file').catch(() => null) ?? null;
   renderCharacterTiles();
-  const tinyLoaded = listTinyimgenCharacters().then((list) => {
+  // the engine's characters (engine/models/) need nothing else running; tinyimgen adds the ones the engine lacks
+  const engineLoaded = listEngineModels().then((list) => {
+    engineChars = list.filter((m) => m.meta?.tinyimgen?.role === 'character')
+      .map((m) => ({ file: m.file, name: m.name, tinyimgenId: m.meta.tinyimgen.id, controller: m.meta.controller }));
+    renderCharacterTiles();
+  }).catch(() => {}); // served without the engine library
+  const tinyLoaded = engineLoaded.then(() => listTinyimgenCharacters()).then((list) => {
     tinyChars = list;
     renderCharacterTiles();
-    if (!list.length) setCharMsg('tinyimgen has no rigged characters yet: build one with "Rig + animations" on.');
+    if (!list.length && !engineChars.length) setCharMsg('tinyimgen has no rigged characters yet: build one with "Rig + animations" on.');
   }).catch((err) => {
-    $('chars-note').textContent = `${err.message} at /tinyimgen. Start tinyimgen (server.py) to pick its characters.`;
+    $('chars-note').textContent = engineChars.length
+      ? 'tinyimgen isn\'t running: only the engine\'s characters are listed.'
+      : `${err.message} at /tinyimgen. Start tinyimgen (server.py) to pick its characters.`;
   });
+  await engineLoaded;
   let spec = { kind: 'capsule', name: 'Capsule' };
-  if (saved?.kind === 'tinyimgen') spec = saved;
-  else if (saved?.kind === 'file' && fileChar) spec = { kind: 'file', ...fileChar };
-  if (spec.kind === 'tinyimgen') await tinyLoaded; // so its tile is there when it loads
+  if (saved?.kind === 'engine' && engineChars.some((c) => c.file === saved.file)) spec = saved;
+  else if (saved?.kind === 'tinyimgen') {
+    const copy = engineChars.find((c) => c.tinyimgenId === saved.id);
+    if (copy) spec = { kind: 'engine', file: copy.file, name: copy.name }; // the engine has it: no tinyimgen needed
+    else {
+      await tinyLoaded; // only load it from tinyimgen if tinyimgen is up and still has it
+      if (tinyChars.some((c) => c.id === saved.id)) spec = saved;
+    }
+  } else if (saved?.kind === 'file' && fileChar) spec = { kind: 'file', ...fileChar };
   if (charSpec.kind === 'map') return; // the map brought its own player
   const wantThird = view.mode === 'third';
   view.mode = 'first';

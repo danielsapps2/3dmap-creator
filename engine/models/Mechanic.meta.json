@@ -1,0 +1,13 @@
+{
+  "tinyimgen": {
+    "id": "1791817421066",
+    "role": "character"
+  },
+  "grip": null,
+  "controller": {
+    "walkSpeed": 4,
+    "runSpeed": 6,
+    "walkRate": 0.4,
+    "runRate": 0.5
+  }
+}

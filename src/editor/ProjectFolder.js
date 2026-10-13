@@ -4,13 +4,15 @@
 //                             index of the files below (pretty-printed JSON)
 //   scripts/**/<Name>.js      one file per script (subfolders allowed)
 //   assets/**/<name>.glb      the models
-//   clips/**/<Name>.clip.json one file per animation clip
 //   terrain/heights.f32, terrain/colors.f32   the terrain grid (raw little-endian Float32)
 //
-// Uses the File System Access API (Chrome / Edge). Scripts, models and clips are written as soon as they change
+// Animation clips live in the engine (engine/clips/), not here. A clips/ folder from an older project is still read
+// (its clips join the engine's) but never written or watched.
+//
+// Uses the File System Access API (Chrome / Edge). Scripts and models are written as soon as they change
 // (saveFiles); Ctrl+S also writes project.json and the terrain (save). While a folder is open the editor polls it, so
 // files added, edited or deleted outside the editor (VS Code, a file manager) show up (watch).
-import { projectToJSON, projectFromJSON, PROJECT_FORMAT } from './Project.js';
+import { projectFromJSON, PROJECT_FORMAT } from './Project.js';
 import { idbGet, idbSet, idbDelete } from '../core/storage.js';
 import { uid } from '../core/utils.js';
 import { stemOf } from '../core/paths.js';
@@ -77,7 +79,6 @@ async function listTree(root, dir) {
 }
 
 const f32Blob = (a) => new Blob([a.buffer.slice(a.byteOffset, a.byteOffset + a.byteLength)]);
-const clipText = (clip) => projectToJSON(clip);
 
 export class ProjectFolder {
   constructor(handle) {
@@ -119,11 +120,11 @@ export class ProjectFolder {
   // ------------------------------------------------------------------ write
 
   /**
-   * Write the scripts, models and clips that changed since the editor last wrote or read them, and delete the files
-   * of ones that were removed or renamed (only files the editor knows about). files: { scripts, assets, clips } as in
+   * Write the scripts and models that changed since the editor last wrote or read them, and delete the files
+   * of ones that were removed or renamed (only files the editor knows about). files: { scripts, assets } as in
    * serializeProject(). A file changed on disk *and* in the editor is overwritten and reported in conflicts.
    */
-  async saveFiles({ scripts = [], assets = [], clips = [] }) {
+  async saveFiles({ scripts = [], assets = [] }) {
     const root = this.handle;
     const conflicts = [];
     const live = new Set();
@@ -139,15 +140,16 @@ export class ProjectFolder {
       this.synced.set(path, { text: content, modified: f.lastModified });
     };
     for (const s of scripts) await text(s.path, s.source, s.name ?? stemOf(s.path));
-    for (const c of clips) await text(c.path, clipText(c), c.name);
     for (const a of assets) {
       live.add(a.path);
-      if (this.synced.get(a.path)?.size === a.buffer.byteLength) continue;
+      const known = this.synced.get(a.path);
+      if (known && (known.buffer ? known.buffer === a.buffer : known.size === a.buffer.byteLength)) continue;
       const f = await writeFile(root, a.path, a.buffer);
-      this.synced.set(a.path, { size: f.size, modified: f.lastModified });
+      this.synced.set(a.path, { size: f.size, modified: f.lastModified, buffer: a.buffer });
     }
     for (const path of [...this.synced.keys()]) {
-      if ((isScriptPath(path) || isClipPath(path) || isModelPath(path)) && !live.has(path)) {
+      // a project's clips/ (from before clips lived in the engine) is left alone
+      if ((isScriptPath(path) || isModelPath(path)) && !live.has(path)) {
         await removeFile(root, path);
         this.synced.delete(path);
       }
@@ -163,8 +165,7 @@ export class ProjectFolder {
     const t = data.terrain;
     await writeFile(root, 'terrain/heights.f32', f32Blob(t.heights));
     await writeFile(root, 'terrain/colors.f32', f32Blob(t.colors));
-    await removeFile(root, 'clips.json'); // the old one-file library: the clips are in clips/ now
-    const { assets, scripts, clips, terrain, ...rest } = data;
+    const { assets, scripts, clips, terrain, ...rest } = data; // clips: the engine's, not written here
     const manifest = {
       ...rest,
       format: PROJECT_FORMAT,
@@ -172,7 +173,6 @@ export class ProjectFolder {
       terrain: { size: t.size, segments: t.segments, material: t.material, heights: 'terrain/heights.f32', colors: 'terrain/colors.f32' },
       scripts: scripts.map((s) => ({ id: s.id, file: s.path })),
       assets: assets.map((a) => ({ id: a.id, name: a.name, file: a.path, meta: a.meta })),
-      clips: clips.map((c) => ({ id: c.id, file: c.path })),
     };
     this.manifestModified = (await writeFile(root, MANIFEST, `${JSON.stringify(manifest, null, 2)}\n`)).lastModified;
     return result;
@@ -200,8 +200,9 @@ export class ProjectFolder {
   async _readModel(path) {
     const f = await readFile(this.handle, path);
     if (!f) return null;
-    this.synced.set(path, { size: f.size, modified: f.lastModified });
-    return f.arrayBuffer();
+    const buffer = await f.arrayBuffer();
+    this.synced.set(path, { size: f.size, modified: f.lastModified, buffer });
+    return buffer;
   }
 
   async _readClip(path, id) {
@@ -276,7 +277,7 @@ export class ProjectFolder {
    * learn what's on disk, and take script files edited after `since` (ms) into the library. Files the libraries
    * don't have yet stay unknown, so watch() brings them in. Returns the names of the scripts it took.
    */
-  async attach({ scripts, clips, assets }, since = 0) {
+  async attach({ scripts, assets }, since = 0) {
     await this._manifest().catch(() => null);
     const taken = [];
     for (const path of await listTree(this.handle, 'scripts')) {
@@ -286,11 +287,6 @@ export class ProjectFolder {
       const text = await f.text();
       this.synced.set(path, { text, modified: f.lastModified });
       if (mine.source !== text && f.lastModified > since) { scripts.update(mine.id, { source: text }); taken.push(mine.name); }
-    }
-    for (const path of await listTree(this.handle, 'clips')) {
-      if (!isClipPath(path) || !clips.byPath(path)) continue;
-      const f = await readFile(this.handle, path);
-      this.synced.set(path, { text: await f.text(), modified: f.lastModified });
     }
     for (const path of await listTree(this.handle, 'assets')) {
       if (!isModelPath(path) || !assets.byPath(path)) continue;
@@ -306,7 +302,6 @@ export class ProjectFolder {
   /**
    * Poll for changes made outside the editor and report them:
    *   on.script({ path, text }) a script file changed      on.scriptAdded({ path, text })   on.scriptRemoved(path)
-   *   on.clip({ path, clip })   a clip file changed        on.clipAdded({ path, clip })     on.clipRemoved(path)
    *   on.modelAdded({ path, buffer })                       on.modelRemoved(path)           on.manifest()
    */
   watch(on, interval = 1000) {
@@ -322,7 +317,7 @@ export class ProjectFolder {
         if (known && known.modified === f.lastModified) continue;
         const value = await read(f);
         if (known && 'text' in known && known.text === value.text) { known.modified = f.lastModified; continue; }
-        this.synced.set(path, value.text !== undefined ? { text: value.text, modified: f.lastModified } : { size: f.size, modified: f.lastModified });
+        this.synced.set(path, value.text !== undefined ? { text: value.text, modified: f.lastModified } : { size: f.size, modified: f.lastModified, buffer: value.buffer });
         await (known ? changed : added)?.({ path, ...value });
       }
       for (const path of [...this.synced.keys()]) {
@@ -337,10 +332,6 @@ export class ProjectFolder {
         await scan('scripts', isScriptPath, {
           read: async (f) => ({ text: await f.text() }),
           changed: on.script, added: on.scriptAdded, removed: on.scriptRemoved,
-        });
-        await scan('clips', isClipPath, {
-          read: async (f) => { const text = await f.text(); let clip = null; try { clip = projectFromJSON(text); } catch { /* half-written */ } return { text, clip }; },
-          changed: (v) => v.clip && on.clip?.(v), added: (v) => v.clip && on.clipAdded?.(v), removed: on.clipRemoved,
         });
         await scan('assets', isModelPath, {
           read: async (f) => ({ buffer: await f.arrayBuffer() }),

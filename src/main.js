@@ -10,6 +10,8 @@ import { idbGet, idbSet, idbDelete } from './core/storage.js';
 import { entitySubtree, isShown } from './editor/Entities.js';
 import { entityRig } from './editor/Rig.js';
 import { watchTinyimgenProps } from './editor/Tinyimgen.js';
+import { watchEngineModels } from './editor/EngineModels.js';
+import { connectEngineClips } from './editor/EngineClips.js';
 import { ClipLibrary } from './anim/clips.js';
 import { AnimEditor } from './anim/AnimEditor.js';
 import { ScriptLibrary } from './editor/Scripts.js';
@@ -27,14 +29,24 @@ window.editor = editor; // handy for console tinkering
 const scripts = (editor.scripts = new ScriptLibrary());
 scripts.addEventListener('changed', () => { editor.emit('scriptsChanged'); editor.emit('changed'); });
 
-// The shared animation clip library: kept in IndexedDB on its own (so it outlives any one map) and saved inside
-// project files too. The animation editor edits it; ▶ Play hands it to the playtest.
+// The animation clip library lives in the engine (engine/clips/, EngineClips.js), shared by every project; projects
+// don't keep clips. The animation editor edits it; ▶ Play hands it to the playtest, and exported maps carry it.
+// IndexedDB keeps a copy for when the editor runs without the engine library (a static build).
 const clips = (editor.clips = new ClipLibrary());
-const clipsLoaded = idbGet('clip-library').then((list) => clips.load(list)).catch((err) => console.warn('clip library', err));
+const clipsLoaded = (async () => {
+  const cached = await idbGet('clip-library').catch(() => null);
+  const migrated = await idbGet('clip-library-in-engine').catch(() => false);
+  // the browser's library from before the engine kept clips joins the engine once (the engine's versions win)
+  if (await connectEngineClips(clips, { ui: { toast }, legacy: migrated ? null : cached })) {
+    if (!migrated) idbSet('clip-library-in-engine', true).catch(() => {});
+  } else {
+    clips.load(cached);
+  }
+})().catch((err) => console.warn('clip library', err));
 let clipsTimer = null;
 clips.addEventListener('changed', () => {
   clearTimeout(clipsTimer);
-  clipsTimer = setTimeout(() => idbSet('clip-library', clips.toJSON()).catch((err) => toast(`Couldn't save the clip library: ${err.message}`, { type: 'error' })), 800);
+  clipsTimer = setTimeout(() => idbSet('clip-library', clips.toJSON()).catch(() => {}), 800);
 });
 
 // ------------------------------------------------------------------ actions
@@ -83,7 +95,7 @@ const confirmBox = (title, text, ok) => new Promise((resolve) => {
   modal(title, h('p', {}, text), { actions: [{ label: 'Cancel', run: () => resolve(false) }, { label: ok, cls: 'btn-primary', run: () => resolve(true) }] });
 });
 
-// The project as a folder of files (ProjectFolder.js): scripts/, assets/, clips/ are written as they change; Ctrl+S
+// The project as a folder of files (ProjectFolder.js): scripts/ and assets/ are written as they change; Ctrl+S
 // writes project.json. Edits made outside (VS Code) come in while it's open.
 const sync = new ProjectSync(editor, {
   toast,
@@ -155,7 +167,7 @@ function playtestPlayer() {
     const asset = editor.assets.get(character.entity.assetId);
     // its height in the editor: the asset's size times its world scale
     const scale = character.getWorldScale(character.scale.clone()).y;
-    return { spawnId: spawn.entity.id, characterId: character.entity.id, name: character.name, buffer: asset.buffer, scale, height: asset.size.y * scale };
+    return { spawnId: spawn.entity.id, characterId: character.entity.id, name: character.name, buffer: asset.buffer, scale, height: asset.size.y * scale, controller: asset.meta?.controller ?? null };
   }
   return null;
 }
@@ -200,6 +212,16 @@ watchTinyimgenProps(editor, {
   onUpdate: (asset, placed) => {
     toast(`Updated ${asset.name} from tinyimgen${placed ? ` (${placed} placed)` : ''}`, { type: 'ok' });
     clearTimeout(playtestRefresh); // several props saved at once: one reload
+    playtestRefresh = setTimeout(refreshPlaytest, 300);
+  },
+});
+
+// Models shared through the engine (engine/models/) follow it: a newer engine version replaces the project's copy and
+// its placed objects, and project models identical to an engine model get linked to it.
+watchEngineModels(editor, {
+  onUpdate: (asset, placed) => {
+    toast(`Updated ${asset.name} from the engine${placed ? ` (${placed} placed)` : ''}`, { type: 'ok' });
+    clearTimeout(playtestRefresh);
     playtestRefresh = setTimeout(refreshPlaytest, 300);
   },
 });
