@@ -5,14 +5,37 @@ import { exportMap, exportLayoutJSON } from './editor/Export.js';
 import { Inspector } from './ui/Inspector.js';
 import { buildPanel, terrainPanel, assetsPanel, outliner } from './ui/Panels.js';
 import { h, button, toast, modal, numberInput, row, checkbox } from './ui/dom.js';
-import { downloadBlob, pickFiles, slug } from './core/utils.js';
+import { downloadBlob, saveBlobAs, pickFiles, slug } from './core/utils.js';
 import { idbGet, idbSet, idbDelete } from './core/storage.js';
 import { entitySubtree, isShown } from './editor/Entities.js';
 import { entityRig } from './editor/Rig.js';
+import { watchTinyimgenProps } from './editor/Tinyimgen.js';
+import { ClipLibrary } from './anim/clips.js';
+import { AnimEditor } from './anim/AnimEditor.js';
+import { ScriptLibrary } from './editor/Scripts.js';
+import { ScriptEditor } from './ui/ScriptEditor.js';
+import { explorer } from './ui/Explorer.js';
+import { PlayMode } from './ui/PlayMode.js';
+import { folderSupported } from './editor/ProjectFolder.js';
+import { ProjectSync } from './editor/ProjectSync.js';
 
 const $ = (id) => document.getElementById(id);
 const editor = new Editor($('viewport'));
 window.editor = editor; // handy for console tinkering
+
+// The map's scripts (saved with the project, exported in the map GLB, run by src/runtime/scripts.js).
+const scripts = (editor.scripts = new ScriptLibrary());
+scripts.addEventListener('changed', () => { editor.emit('scriptsChanged'); editor.emit('changed'); });
+
+// The shared animation clip library: kept in IndexedDB on its own (so it outlives any one map) and saved inside
+// project files too. The animation editor edits it; ▶ Play hands it to the playtest.
+const clips = (editor.clips = new ClipLibrary());
+const clipsLoaded = idbGet('clip-library').then((list) => clips.load(list)).catch((err) => console.warn('clip library', err));
+let clipsTimer = null;
+clips.addEventListener('changed', () => {
+  clearTimeout(clipsTimer);
+  clipsTimer = setTimeout(() => idbSet('clip-library', clips.toJSON()).catch((err) => toast(`Couldn't save the clip library: ${err.message}`, { type: 'error' })), 800);
+});
 
 // ------------------------------------------------------------------ actions
 
@@ -39,6 +62,7 @@ const importGLB = async () => importGLBFiles(await pickFiles('.glb,.gltf', true)
 async function openProjectFile(file) {
   try {
     const data = projectFromJSON(await file.text());
+    sync.setFolder(null); // first: the old folder mustn't follow the editor emptying out (a single-file project: Ctrl+S asks)
     await loadProject(editor, data, { onWarning: (m) => toast(m, { type: 'error', timeout: 6000 }) });
     toast(`Opened ${data.name ?? file.name}`, { type: 'ok' });
   } catch (err) {
@@ -47,15 +71,49 @@ async function openProjectFile(file) {
   }
 }
 
-const openProject = async () => {
+const openProjectFileDialog = async () => {
   const [file] = await pickFiles('.json,.map.json');
   if (file) openProjectFile(file);
 };
+const openProject = () => (folderSupported ? openProjectFolder() : openProjectFileDialog());
 
-function saveProject() {
-  const json = projectToJSON(serializeProject(editor));
-  downloadBlob(new Blob([json], { type: 'application/json' }), `${slug(editor.mapName)}.map.json`);
-  toast('Project saved', { type: 'ok' });
+// ------------------------------------------------------------------ project folder
+
+const confirmBox = (title, text, ok) => new Promise((resolve) => {
+  modal(title, h('p', {}, text), { actions: [{ label: 'Cancel', run: () => resolve(false) }, { label: ok, cls: 'btn-primary', run: () => resolve(true) }] });
+});
+
+// The project as a folder of files (ProjectFolder.js): scripts/, assets/, clips/ are written as they change; Ctrl+S
+// writes project.json. Edits made outside (VS Code) come in while it's open.
+const sync = new ProjectSync(editor, {
+  toast,
+  confirm: confirmBox,
+  scriptChangedOnDisk: (id, text) => scriptEditor.external(id, text),
+  reloadGame: () => refreshPlaytest(),
+});
+sync.addEventListener('changed', () => syncStatus());
+const openProjectFolder = () => sync.open();
+
+/** Ctrl+S: into the project's folder (asking for one the first time), or a single file where folders don't work. */
+async function saveProject({ as = false } = {}) {
+  if (!folderSupported) return saveProjectFile();
+  if (await sync.save({ as })) { saveState = `saved to ${sync.name}/`; syncStatus(); }
+}
+
+/** The whole project in one .map.json file (models embedded). */
+async function saveProjectFile() {
+  try {
+    // The picker opens before serializing so it still has the click/keypress's user activation.
+    const saved = await saveBlobAs(
+      () => new Blob([projectToJSON(serializeProject(editor))], { type: 'application/json' }),
+      `${slug(editor.mapName)}.map.json`,
+      { description: 'Map project', accept: { 'application/json': ['.json'] } },
+    );
+    if (saved) toast('Project saved', { type: 'ok' });
+  } catch (err) {
+    console.error(err);
+    toast(`Save failed: ${err.message}`, { type: 'error', timeout: 6000 });
+  }
 }
 
 async function exportGLB(binary = true) {
@@ -102,18 +160,79 @@ function playtestPlayer() {
   return null;
 }
 
+/** Export the map (and the player's model) for the playtest page to load. */
+async function writePlaytest() {
+  const blob = await exportMap(editor, { binary: true, includeTerrain: true, includeMarkers: true });
+  const player = playtestPlayer();
+  await (player ? idbSet('playtest-player', player) : idbDelete('playtest-player'));
+  await idbSet('playtest', await blob.arrayBuffer());
+  await idbSet('playtest-clips', clips.toJSON());
+}
+
+/** Re-export the playtest and have an open playtest tab reload it in place (nothing listens if none is open). */
+async function refreshPlaytest() {
+  try {
+    await writePlaytest();
+    playtestChannel.postMessage({ type: 'reload' });
+    playMode.reloaded();
+  } catch (err) {
+    console.error(err);
+    toast(`Couldn't update the playtest: ${err.message}`, { type: 'error' });
+  }
+}
+
+const playtestChannel = new BroadcastChannel('3dmap-playtest');
+
 async function playtest() {
   try {
-    const blob = await exportMap(editor, { binary: true, includeTerrain: true, includeMarkers: true });
-    const player = playtestPlayer();
-    await (player ? idbSet('playtest-player', player) : idbDelete('playtest-player'));
-    await idbSet('playtest', await blob.arrayBuffer());
+    await writePlaytest();
     window.open('./game.html?playtest=1', '3dmap-playtest');
   } catch (err) {
     console.error(err);
     toast(`Playtest failed: ${err.message}`, { type: 'error' });
   }
 }
+
+// A prop re-saved in tinyimgen's Prop Editor shows up here without re-importing it, and in a playtest tab if one
+// is open (it reloads the map in place when told to; with none open, nothing listens).
+let playtestRefresh = null;
+watchTinyimgenProps(editor, {
+  onUpdate: (asset, placed) => {
+    toast(`Updated ${asset.name} from tinyimgen${placed ? ` (${placed} placed)` : ''}`, { type: 'ok' });
+    clearTimeout(playtestRefresh); // several props saved at once: one reload
+    playtestRefresh = setTimeout(refreshPlaytest, 300);
+  },
+});
+
+// ▶ Play runs the playtest inside the viewport (↗ opens it in a tab instead).
+const playBtn = button('▶ Play', () => playMode.toggle(), { cls: 'btn-play', title: 'Play the map right here (Ctrl+P)' });
+const playMode = new PlayMode(editor, {
+  prepare: writePlaytest,
+  openInTab: () => playtest(),
+  onChange: () => {
+    playBtn.textContent = playMode.starting && !playMode.playing ? 'Starting…' : playMode.playing ? '⏹ Stop' : '▶ Play';
+    playBtn.classList.toggle('btn-danger', playMode.playing);
+    playBtn.disabled = playMode.starting && !playMode.playing;
+    document.body.classList.toggle('playing', playMode.playing);
+  },
+});
+window.playMode = playMode;
+
+const animEditor = new AnimEditor(editor, clips, {
+  onClose: ({ changed }) => {
+    if (playMode.playing) editor.setPaused(true); // the game still covers the viewport
+    if (changed) refreshPlaytest();
+  },
+});
+window.animEditor = animEditor;
+
+// Saving a script reloads an open playtest, so a change shows up right away.
+const scriptEditor = new ScriptEditor(scripts, { onSaved: () => refreshPlaytest() });
+editor.on('openScript', (id) => scriptEditor.open(id));
+const openAnimEditor = async () => {
+  await clipsLoaded;
+  animEditor.open().catch((err) => { console.error(err); toast(`Animation editor: ${err.message}`, { type: 'error', timeout: 6000 }); });
+};
 
 async function importHeightmap(file) {
   if (!file) [file] = await pickFiles('image/*');
@@ -146,7 +265,7 @@ function newMap() {
   modal('New map?', h('p', {}, 'This clears the current map. Save first if you want to keep it.'), {
     actions: [
       { label: 'Cancel', run: () => {} },
-      { label: 'Clear map', cls: 'btn-danger', run: () => { editor.clearAll(); toast('New map'); } },
+      { label: 'Clear map', cls: 'btn-danger', run: () => { sync.setFolder(null); editor.clearAll(); toast('New map'); } },
     ],
   });
 }
@@ -167,7 +286,7 @@ function showHelp() {
     ['B', 'Toggle sculpt mode'], ['[ / ]', 'Brush radius'], ['1–6', 'Brush tool (in sculpt mode)'],
     ['F', 'Focus selected (or whole map)'], ['G', 'Drop selected to ground'],
     ['Ctrl+D', 'Duplicate'], ['Delete / Backspace', 'Delete'], ['Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y', 'Undo / Redo'],
-    ['Ctrl+S', 'Save project'], ['Ctrl+E', 'Export map'], ['Shift+Click (placing)', 'Keep placing'], ['Esc', 'Cancel / deselect'],
+    ['Ctrl+S', 'Save project'], ['Ctrl+E', 'Export map'], ['Ctrl+P', 'Play in the editor / stop'], ['Shift+Click (placing)', 'Keep placing'], ['Esc', 'Cancel / deselect'],
   ];
   modal('Controls', h('table', { class: 'keys' }, ...keys.map(([k, d]) => h('tr', {}, h('td', {}, h('kbd', {}, k)), h('td', {}, d)))));
 }
@@ -200,8 +319,17 @@ $('topbar').append(
   h('div', { class: 'brand' }, '⛰ ', h('span', {}, '3D Map Creator')),
   menu('File', [
     ['New map', newMap],
-    ['Open project…', openProject, 'Ctrl+O'],
-    ['Save project', saveProject, 'Ctrl+S'],
+    ...(folderSupported ? [
+      ['Open project folder…', openProjectFolder, 'Ctrl+O'],
+      ['Save project', () => saveProject(), 'Ctrl+S'],
+      ['Save project as folder…', () => saveProject({ as: true })],
+      '-',
+      ['Open project file (.map.json)…', openProjectFileDialog],
+      ['Save as single file (.map.json)…', saveProjectFile],
+    ] : [
+      ['Open project…', openProjectFileDialog, 'Ctrl+O'],
+      ['Save project', saveProjectFile, 'Ctrl+S'],
+    ]),
     '-',
     ['Import GLB model…', importGLB, 'Ctrl+I'],
     ['Import heightmap…', () => importHeightmap()],
@@ -232,7 +360,9 @@ $('topbar').append(
     snapField('⟳', snapR, '°', 'Rotate snap (degrees)'),
     snapField('⤢', snapS, '×', 'Scale snap (step)')),
   h('div', { class: 'spacer' }),
-  button('▶ Play', playtest, { cls: 'btn-play', title: 'Playtest the map in a first-person demo (opens new tab)' }),
+  button('🎬 Animate', openAnimEditor, { cls: 'btn', title: 'Animation editor: refine and make clips for tinyimgen characters' }),
+  playBtn,
+  button('↗', playtest, { cls: 'btn-icon', title: 'Playtest in a new tab' }),
   button('Export', exportDialog, { cls: 'btn-primary', title: 'Export map (Ctrl+E)' }),
   button('?', showHelp, { cls: 'btn-icon', title: 'Controls' }),
 );
@@ -255,7 +385,7 @@ syncToolbar();
 
 // ------------------------------------------------------------------ left panel tabs
 
-const TABS = [['build', 'Build'], ['terrain', 'Terrain'], ['assets', 'Models']];
+const TABS = [['build', 'Build'], ['terrain', 'Terrain'], ['assets', 'Models'], ['files', 'Files']];
 const tabBtns = TABS.map(([id, label]) => h('button', { class: 'tab', onclick: () => showTab(id) }, label));
 $('tabs').append(...tabBtns);
 function showTab(id) {
@@ -270,6 +400,13 @@ editor.on('modeChanged', (m) => { if (m === 'sculpt') showTab('terrain'); });
 buildPanel($('tab-build'), editor);
 terrainPanel($('tab-terrain'), editor, { importHeightmap: () => importHeightmap(), exportHeightmap });
 assetsPanel($('tab-assets'), editor, { importGLB });
+explorer($('tab-files'), editor, sync, {
+  openScript: (id) => scriptEditor.open(id),
+  openClip: async (id) => { await clipsLoaded; await animEditor.open(); animEditor.selectClip(id); },
+  importModels: () => importGLB(),
+  openFolder: openProjectFolder,
+  saveFolder: () => saveProject({ as: true }),
+});
 outliner($('outliner'), editor);
 new Inspector($('inspector'), editor);
 
@@ -285,7 +422,7 @@ const syncStatus = () => {
   $('viewport-hint').textContent = editor.mode === 'select' ? '' : HINTS[editor.mode];
   $('viewport-hint').hidden = editor.mode === 'select';
   const n = editor.objects.length;
-  $('status-info').textContent = `${editor.mapName} · ${n} object${n === 1 ? '' : 's'}${saveState ? ` · ${saveState}` : ''}`;
+  $('status-info').textContent = `${editor.mapName}${sync?.name ? ` · 📁 ${sync.name}` : ''} · ${n} object${n === 1 ? '' : 's'}${saveState ? ` · ${saveState}` : ''}`;
 };
 let saveState = '';
 editor.on('modeChanged', syncStatus);
@@ -325,6 +462,7 @@ window.addEventListener('keydown', (e) => {
     else if (k === 'o') { openProject(); e.preventDefault(); }
     else if (k === 'e') { exportDialog(); e.preventDefault(); }
     else if (k === 'i') { importGLB(); e.preventDefault(); }
+    else if (k === 'p') { playMode.toggle(); e.preventDefault(); }
     return;
   }
   if (e.altKey) return;
@@ -400,8 +538,10 @@ editor.on('changed', () => {
   try {
     const data = await idbGet('autosave');
     if (data) {
-      await loadProject(editor, data, { onWarning: (m) => toast(m, { type: 'error', timeout: 6000 }) });
+      await loadProject(editor, data, { onWarning: (m) => toast(m, { type: 'error', timeout: 6000 }), mergeClips: false });
       toast('Restored your last session', { type: 'ok' });
+      // the session's project folder: reconnect (the browser may want a click to allow it again)
+      await sync.reconnect(Date.parse(data.savedAt) || 0);
     } else {
       // First run: give the user something to look at.
       editor.terrainCommand('Generate terrain', (t) => {

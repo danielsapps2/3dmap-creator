@@ -1,8 +1,12 @@
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { clone as skeletonClone } from 'three/addons/utils/SkeletonUtils.js';
-import { customPropsToObject, isEditorOnly, childEntities, parentEntity } from './Entities.js';
+import { customPropsToObject, isEditorOnly, childEntities, parentEntity, isShown } from './Entities.js';
 import { holdData } from './Rig.js';
+import { usedScripts } from './Scripts.js';
+import { findBones } from '../anim/skeleton.js';
+import { rigOf, clipFromThree, LOCOMOTION } from '../anim/clips.js';
+import { arrayBufferToBase64 } from '../core/utils.js';
 
 export const MAP_FORMAT = '3dmap-creator';
 
@@ -29,12 +33,20 @@ export function exportUserData(obj, editor) {
     const asset = editor.assets.get(e.assetId);
     ud.asset = asset?.name ?? e.assetId;
     if (asset?.meta.tinyimgen) ud.tinyimgen = { ...asset.meta.tinyimgen };
-    if (asset?.rig) ud.rig = { sockets: [...asset.rig.sockets] };
+    if (asset?.rig) {
+      ud.rig = { sockets: [...asset.rig.sockets] };
+      // the node is exported in the editor's pose; animating it from code needs the hips' rest position
+      const hips = findBones(asset.scene)?.Hips;
+      if (hips) ud.rig.restHips = hips.position.toArray();
+    }
     if (asset?.prop) ud.grip = holdData(obj, editor.assets); // tinyimgen grip.json + this instance's edits
   } else if (e.kind === 'marker') {
     ud.marker = e.type;
     ud.params = { ...e.params };
   }
+  // scripts attached in the editor (sources are on the scene root): run by src/runtime/scripts.js
+  const scripts = (e.scripts ?? []).map((r) => ({ ref: r, script: editor.scripts?.get(r.id) })).filter((x) => x.script);
+  if (scripts.length) ud.scripts = scripts.map(({ ref, script }) => ({ script: script.id, name: script.name, params: { ...ref.params } }));
   return ud;
 }
 
@@ -115,6 +127,13 @@ export function buildExportScene(editor, { includeTerrain = true, includeMarkers
     environment: { ...editor.env },
     terrain: includeTerrain ? { name: 'Terrain', size: t.size, segments: t.segments } : null,
   };
+  const shown = editor.objects.filter((o) => isShown(o));
+  if (editor.scripts) {
+    const scripts = usedScripts(editor.scripts, shown);
+    if (Object.keys(scripts).length) root.userData.scripts = scripts;
+  }
+  const clips = animationClips(editor, shown);
+  if (clips.length) root.userData.clips = encodeClips(clips);
   if (includeTerrain) {
     const mesh = new THREE.Mesh(t.mesh.geometry, t.material);
     mesh.name = 'Terrain';
@@ -131,6 +150,40 @@ export function buildExportScene(editor, { includeTerrain = true, includeMarkers
     if (c) root.add(c);
   }
   return root;
+}
+
+/**
+ * Clips for animating the map's tinyimgen characters from code (runtime/animator.js): the editor's clip library,
+ * plus each character's own locomotion clips (Idle, Walk…), marked with `owner` (the model's name, as in
+ * userData.asset): every character plays its own, fitted to its body by tinyimgen, unless the library has one by
+ * that name. Empty without characters.
+ */
+function animationClips(editor, objects) {
+  const characters = [...new Set(objects.filter((o) => o.entity.kind === 'asset').map((o) => editor.assets.get(o.entity.assetId)))]
+    .filter((a) => a?.rig && findBones(a.scene));
+  if (!characters.length) return [];
+  const clips = [...(editor.clips?.clips ?? [])];
+  for (const owner of characters) {
+    owner._clipCache ??= new Map();
+    for (const name of LOCOMOTION) {
+      const own = owner.animations.find((c) => c.name === name);
+      if (!own || clips.some((c) => c.name === name && !c.owner)) continue;
+      if (!owner._clipCache.has(name)) owner._clipCache.set(name, clipFromThree(own, rigOf(owner.scene), { source: `character:${name}` }));
+      clips.push({ ...owner._clipCache.get(name), owner: owner.name });
+    }
+  }
+  return clips;
+}
+
+/** Clips as glTF extras (plain JSON): Float32Arrays become { $f32: base64 } (decodeClips in runtime/animator.js). */
+function encodeClips(clips) {
+  const enc = (v) => {
+    if (v instanceof Float32Array) return { $f32: arrayBufferToBase64(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)) };
+    if (Array.isArray(v)) return v.map(enc);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, enc(x)]));
+    return v;
+  };
+  return clips.map(enc);
 }
 
 /** Returns a Blob containing a .glb (binary) or .gltf (JSON) of the map. */

@@ -227,6 +227,7 @@ export function createCapsuleCollider(node) {
     isStatic: node.userData.static !== false,
     box: new THREE.Box3(new THREE.Vector3(cx - radius, bottom, cz - radius), new THREE.Vector3(cx + radius, top, cz + radius)),
     center: new THREE.Vector3(cx, bottom, cz),
+    matrix, // the node's world matrix it was built from (scripts.js rebuilds it when the node moves)
     radius,
     height,
     surfaceAt(x, z, r = 0, normal = null) {

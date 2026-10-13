@@ -4,10 +4,39 @@ import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { parseMap, applyEnvironment } from '../runtime/MapLoader.js';
 import { idbGet, idbSet } from '../core/storage.js';
+import { runScripts } from '../runtime/scripts.js';
 import { loadCharacter } from './Character.js';
 import { listTinyimgenCharacters } from '../core/tinyimgen.js';
+import CONTROLLER_SOURCE from '../runtime/PlayerController.script.js?raw';
 
 const $ = (id) => document.getElementById(id);
+
+// Inside the editor's play mode (an iframe over its viewport): talk to the editor, which can pause and stop the game.
+const embedded = new URLSearchParams(location.search).has('embed') && window.parent !== window;
+const toEditor = (type, data = {}) => { if (embedded) window.parent.postMessage({ from: '3dmap-play', type, ...data }, location.origin); };
+let paused = false;
+if (embedded) {
+  document.body.classList.add('embedded');
+  window.addEventListener('message', (e) => {
+    if (e.source !== window.parent || e.origin !== location.origin) return;
+    if (e.data?.type === 'pause') paused = !!e.data.paused;
+  });
+  const text = (args) => {
+    const parts = [];
+    for (const a of args) {
+      if (a instanceof Error) { if (!parts.some((p) => p.includes(a.message))) parts.push(a.message); } // usually already in the text
+      else if (a && typeof a === 'object') { try { parts.push(JSON.stringify(a)); } catch { parts.push(String(a)); } }
+      else parts.push(String(a));
+    }
+    return parts.join(' ');
+  };
+  for (const level of ['warn', 'error']) {
+    const orig = console[level].bind(console);
+    console[level] = (...args) => { orig(...args); toEditor('log', { level, text: text(args) }); };
+  }
+  window.addEventListener('error', (e) => toEditor('log', { level: 'error', text: e.message }));
+  window.addEventListener('unhandledrejection', (e) => toEditor('log', { level: 'error', text: String(e.reason?.message ?? e.reason) }));
+}
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -21,13 +50,11 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color('#222');
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.05, 3000);
 const controls = new PointerLockControls(camera, renderer.domElement);
+controls.enabled = false; // only captures the mouse: the player controller script does the looking
 
-const PLAYER_DEFAULTS = { eye: 1.6, radius: 0.35, height: 1.8, step: 0.45, gravity: 24, jump: 8, walk: 6, run: 11, maxSlope: 50 };
-const PLAYER = { ...PLAYER_DEFAULTS };
-let MIN_WALK_NY = Math.cos(THREE.MathUtils.degToRad(PLAYER.maxSlope)); // steeper surfaces can't be climbed
-/** The Player Spawn's settings (editor: Player Spawn → Camera / Movement) → spawn param key per PLAYER field. */
-const SPAWN_PARAMS = { eye: 'eyeHeight', radius: 'radius', height: 'height', step: 'stepHeight', gravity: 'gravity', jump: 'jump', walk: 'walkSpeed', run: 'runSpeed', maxSlope: 'maxSlope' };
-let spawnView = null; // the spawn's "Start in" camera, overriding the player's choice when set
+// The player's body for collisions: the controller script passes its own to game.physics.move each frame.
+const BODY = { radius: 0.35, height: 1.8, step: 0.45, maxSlope: 50 };
+let spawnView = null; // the controller's "Start in" view, overriding the player's choice when set
 const player = { pos: new THREE.Vector3(), vel: new THREE.Vector3(), onGround: false, groundNormal: new THREE.Vector3(0, 1, 0) };
 let map = null;
 let cameraBlockers = []; // meshes the third-person camera can't pass through (each object's own, never skinned ones)
@@ -40,7 +67,10 @@ const insideTriggers = new Set();
 
 // ------------------------------------------------------------------ loading
 
-async function loadMapBuffer(buffer, label, { playtest = false } = {}) {
+/** keep: reloading the same map after an edit (a prop re-saved in tinyimgen), so the player stays where they are. */
+async function loadMapBuffer(buffer, label, { playtest = false, keep = false } = {}) {
+  scripts?.dispose();
+  scripts = null;
   if (map) scene.remove(map.root);
   envObjects.forEach((o) => scene.remove(o));
   insideTriggers.clear();
@@ -49,7 +79,7 @@ async function loadMapBuffer(buffer, label, { playtest = false } = {}) {
   scene.add(map.root);
   mapPlayer = await findMapPlayer(map, playtest);
   playerSpawn = (mapPlayer && map.spawns.find((s) => s.node === mapPlayer.spawn)) ?? map.spawns[0] ?? null;
-  applySpawnSettings(playerSpawn?.params ?? {});
+  spawnView = null;
   const extent = (map.terrain?.userData.size ?? 100) * 0.75;
   const { hemi, sun } = applyEnvironment(scene, map.environment, { renderer, shadowExtent: extent });
   envObjects = [hemi, sun, sun?.target].filter(Boolean);
@@ -74,23 +104,78 @@ async function loadMapBuffer(buffer, label, { playtest = false } = {}) {
   $('title').textContent = map.name || label;
   $('subtitle').textContent = `${map.objects.length} objects · ${map.spawns.length} spawn(s) · ${map.triggers.length} trigger(s)`;
   $('play').hidden = false;
-  respawn();
-  if (mapPlayer?.buffer) selectCharacter({ kind: 'map', name: mapPlayer.name });
+  if (!keep) setMenu(false); // straight into the game
+  if (!keep) respawn();
+  if (mapPlayer?.buffer && (!keep || charSpec.kind === 'map')) selectCharacter({ kind: 'map', name: mapPlayer.name }, { switchToThird: !keep });
   else if (charSpec.kind === 'map') selectCharacter({ kind: 'capsule', name: 'Capsule' }, { switchToThird: false });
   else renderCharacterTiles();
-  if (spawnView) setView(spawnView);
+  const loaded = map;
+  const started = await runScripts(map, scriptHost);
+  if (map === loaded) scripts = started; else started.dispose(); // another map came in meanwhile
 }
 
-/** Movement, camera and view settings from the Player Spawn (missing ones keep the defaults). */
-function applySpawnSettings(params) {
-  Object.assign(PLAYER, PLAYER_DEFAULTS);
-  for (const [field, key] of Object.entries(SPAWN_PARAMS)) {
-    if (Number.isFinite(params[key])) PLAYER[field] = params[key];
+// ------------------------------------------------------------------ scripts
+
+/** The map's scripts (src/runtime/scripts.js), running while the map is loaded. */
+let scripts = null;
+let interactFocus = null; // { node, prompt } the player can use with E
+
+const scriptHost = {
+  player: {
+    position: player.pos, // feet
+    velocity: player.vel,
+    get onGround() { return player.onGround; },
+    set onGround(v) { player.onGround = !!v; },
+    groundNormal: player.groundNormal,
+    /** The Player Spawn ({ position, rotationY, params }), or null. */
+    get spawn() { return playerSpawn; },
+    respawn: () => respawn(),
+    teleport(x, y, z) { player.pos.set(x, y, z); player.vel.set(0, 0, 0); },
+    /** Play a clip from the editor's animation library on the player character (by name). */
+    playClip(name) {
+      const i = character?.actions.findIndex((c) => c.name === name) ?? -1;
+      return i >= 0 && !!character.playAction(i);
+    },
+    get character() { return character; },
+  },
+  get camera() { return camera; },
+  physics: {
+    move: movePlayer,
+    cameraClearance: (origin, dir, max) => cameraClearance(origin, dir, max),
+    /** Highest surface the player could stand on at (x, z), from feet height y. */
+    groundAt: (x, z, y = Infinity) => groundHeight(x, z, y),
+  },
+  view: {
+    get mode() { return view.mode; },
+    get facing() { return view.facing; },
+    set: (mode, opts) => setView(mode, opts),
+    setFacing: (facing) => setFacing(facing),
+  },
+  /** Maps without a player controller script get this one, with the Player Spawn's settings. */
+  get defaultController() {
+    return { source: CONTROLLER_SOURCE, name: 'Player controller', node: playerSpawn?.node ?? map?.root, params: playerSpawn?.params ?? {} };
+  },
+  message: (text, seconds) => flash(text, seconds * 1000),
+  log: (...args) => { console.log('[script]', ...args); toEditor('log', { level: 'log', text: args.map(String).join(' ') }); },
+  inputActive: () => gameHasInput(),
+  onError: (text, err) => { console.error(text, err); flash(`⚠ ${text}`, 6000, true); },
+  onRemove: (node) => {
+    cameraBlockers = cameraBlockers.filter((m) => !isBelow(m, node));
+    cameraCapsules = cameraCapsules.filter((c) => !isBelow(c.node, node));
+  },
+};
+
+const _box = new THREE.Box3(), _chest = new THREE.Vector3();
+/** The nearest object with onInteract within reach of the player, for the "E" hint. */
+function findInteractable() {
+  if (!scripts) return null;
+  _chest.set(player.pos.x, player.pos.y + 0.9, player.pos.z);
+  let best = null, bestD = 2;
+  for (const it of scripts.interactables()) {
+    const d = _box.setFromObject(it.node).distanceToPoint(_chest);
+    if (d < bestD) { best = it; bestD = d; }
   }
-  MIN_WALK_NY = Math.cos(THREE.MathUtils.degToRad(PLAYER.maxSlope));
-  if (Number.isFinite(params.cameraDistance)) tp.dist = tp.curDist = THREE.MathUtils.clamp(params.cameraDistance, 1.2, 14);
-  spawnView = params.view === 'first' || params.view === 'third' ? params.view : null;
-  if (params.facing === 'free' || params.facing === 'strafe') { view.facing = params.facing; syncViewUI(); }
+  return best;
 }
 
 const isBelow = (node, root) => { for (let o = node; o; o = o.parent) if (o === root) return true; return false; };
@@ -125,9 +210,7 @@ function respawn() {
   }
   player.pos.y = Math.max(player.pos.y, groundHeight(player.pos.x, player.pos.z, player.pos.y + 2));
   player.vel.set(0, 0, 0);
-  // Spawns face -Z (a camera's forward); characters face +Z, so turn them around.
-  tp.yaw = tp.body = (s?.rotationY ?? 0) + Math.PI;
-  tp.slide.set(0, 0);
+  scripts?.game.emit('respawn', s); // the controller turns the view to face the way the spawn does
 }
 
 // ------------------------------------------------------------------ physics
@@ -135,14 +218,14 @@ function respawn() {
 const _n = new THREE.Vector3();
 
 /** How far above the feet a surface may be and still be stepped onto. Steep slopes can't be climbed. */
-const climbFor = (normalY) => (normalY >= MIN_WALK_NY ? PLAYER.step : 0.02);
+const climbFor = (normalY) => (normalY >= Math.cos(THREE.MathUtils.degToRad(BODY.maxSlope)) ? BODY.step : 0.02);
 
 /** Highest surface under (x, z) the player can stand on from feetY. Writes its normal to player.groundNormal. */
 function groundHeight(x, z, feetY) {
   let g = map ? map.getHeightAt(x, z) : 0;
   player.groundNormal.set(0, 1, 0);
   for (const c of solids) {
-    const y = c.surfaceAt(x, z, PLAYER.radius, _n);
+    const y = c.surfaceAt(x, z, BODY.radius, _n);
     if (y !== null && y > g && y <= feetY + climbFor(_n.y)) {
       g = y;
       player.groundNormal.copy(_n);
@@ -153,9 +236,9 @@ function groundHeight(x, z, feetY) {
 
 /** Push the player out of anything too tall (or too steep) to step onto. `prev` is last frame's position. */
 function resolveWalls(p, prev) {
-  const r = PLAYER.radius;
+  const r = BODY.radius;
   for (const c of solids) {
-    if (p.y + PLAYER.height <= c.box.min.y) continue; // walking underneath
+    if (p.y + BODY.height <= c.box.min.y) continue; // walking underneath
     const top = c.surfaceAt(p.x, p.z, r, _n);
     if (top === null || top <= p.y + climbFor(_n.y)) continue;
     if (c.type !== 'capsule' && c.overlaps(prev, r)) {
@@ -171,47 +254,30 @@ function resolveWalls(p, prev) {
 const keys = new Set();
 window.addEventListener('keydown', (e) => {
   keys.add(e.code);
-  if (e.code === 'KeyR') respawn();
-  if (e.code === 'KeyV' && !e.repeat) setView(view.mode === 'third' ? 'first' : 'third');
-  if (e.code === 'KeyT' && !e.repeat && view.mode === 'third') setFacing(view.facing === 'free' ? 'strafe' : 'free');
-  if (e.code === 'Space' && player.onGround && controls.isLocked) { player.vel.y = PLAYER.jump; player.onGround = false; }
+  const digit = /^Digit([1-9])$/.exec(e.code);
+  if (digit && !e.repeat && character?.actions.length) {
+    const clip = character.playAction(+digit[1] - 1);
+    if (clip) flash(`${digit[1]} · ${clip.name}`);
+  }
+  if (e.code === 'KeyE' && !e.repeat && interactFocus && scripts) scripts.interact(interactFocus.node);
+  // in the editor: Esc with the mouse free (the first Esc frees it), or Ctrl+P, stops playing
+  if (embedded && ((e.code === 'Escape' && !controls.isLocked) || ((e.ctrlKey || e.metaKey) && e.code === 'KeyP'))) {
+    e.preventDefault();
+    toEditor('stop');
+  } else if (!embedded && e.code === 'Escape' && !controls.isLocked && map) {
+    setMenu(!menuOpen);
+  }
 });
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 
-const fwd = new THREE.Vector3(), right = new THREE.Vector3(), wish = new THREE.Vector3(), _prev = new THREE.Vector3();
+const _prev = new THREE.Vector3();
 
-const angleTo = (a, b) => Math.atan2(Math.sin(b - a), Math.cos(b - a));
-
-function update(dt) {
-  if (!map) return;
-  const active = controls.isLocked;
-  const ix = active ? (keys.has('KeyA') || keys.has('ArrowLeft') ? 1 : 0) - (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0) : 0;
-  const iz = active ? (keys.has('KeyW') || keys.has('ArrowUp') ? 1 : 0) - (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0) : 0;
-  const running = keys.has('ShiftLeft') || keys.has('ShiftRight');
-  const n = player.groundNormal;
-  const steep = player.onGround && n.y < MIN_WALK_NY;
-
-  if (view.mode === 'third' && character) {
-    moveThirdPerson(dt, ix, iz, running, steep);
-  } else {
-    camera.getWorldDirection(fwd);
-    fwd.y = 0;
-    fwd.normalize();
-    right.crossVectors(fwd, camera.up).normalize();
-    wish.set(0, 0, 0).addScaledVector(fwd, iz).addScaledVector(right, -ix);
-    const speed = running ? PLAYER.run : PLAYER.walk;
-    if (wish.lengthSq() > 0) wish.normalize().multiplyScalar(speed);
-    const accel = player.onGround && !steep ? 12 : 3; // little grip on steep slopes
-    player.vel.x += (wish.x - player.vel.x) * Math.min(1, accel * dt);
-    player.vel.z += (wish.z - player.vel.z) * Math.min(1, accel * dt);
-    // Steep ground: slide down it instead of standing still.
-    if (steep) {
-      player.vel.x += n.x * PLAYER.gravity * dt;
-      player.vel.z += n.z * PLAYER.gravity * dt;
-    }
-  }
-  player.vel.y -= PLAYER.gravity * dt;
-
+/**
+ * Walk the player by its velocity for dt: slide along walls, climb steps and ramps, land on (and stick to) the
+ * ground. body: { radius, height, step, maxSlope } (the controller's settings). Exposed to scripts as game.physics.move.
+ */
+function movePlayer(dt, body = {}) {
+  Object.assign(BODY, body);
   const p = player.pos;
   const prevPos = _prev.copy(p);
   const wasOnGround = player.onGround;
@@ -220,7 +286,7 @@ function update(dt) {
   resolveWalls(p, prevPos);
   p.y += player.vel.y * dt;
   const g = groundHeight(p.x, p.z, prevPos.y);
-  if (p.y <= g || (wasOnGround && player.vel.y <= 0 && p.y - g <= PLAYER.step)) {
+  if (p.y <= g || (wasOnGround && player.vel.y <= 0 && p.y - g <= BODY.step)) {
     // Land, climb ramps/steps, and stick to the ground walking downhill instead of bouncing off it.
     p.y = g;
     player.vel.y = 0;
@@ -229,68 +295,42 @@ function update(dt) {
     player.onGround = false;
   }
   if (p.y < -200) respawn();
+  return player.onGround;
+}
 
-  if (view.mode === 'third' && character) {
-    character.root.position.copy(p);
-    character.root.rotation.y = tp.body;
-    updateThirdPersonCamera(dt);
-  } else {
-    camera.position.set(p.x, p.y + PLAYER.eye, p.z);
-  }
+function update(dt) {
+  if (!map) return;
+  const active = gameHasInput();
+  scripts?.update(dt); // the player controller script moves the player and the camera
+  const p = player.pos;
   $('pos').textContent = `x ${p.x.toFixed(1)}  y ${p.y.toFixed(1)}  z ${p.z.toFixed(1)}`;
 
   // Trigger volumes
   const probe = new THREE.Vector3(p.x, p.y + 0.9, p.z);
   for (const t of map.triggers) {
     const inside = t.contains(probe);
-    if (inside && !insideTriggers.has(t)) { insideTriggers.add(t); flash(`Entered “${t.name}”${t.event ? ` → ${t.event}` : ''}`); }
-    else if (!inside && insideTriggers.has(t)) { insideTriggers.delete(t); flash(`Left “${t.name}”`); }
+    const scripted = !!t.node.userData.scripts?.length; // its scripts decide what the player sees
+    if (inside && !insideTriggers.has(t)) {
+      insideTriggers.add(t);
+      if (!scripted) flash(`Entered “${t.name}”${t.event ? ` → ${t.event}` : ''}`);
+      scripts?.triggerEnter(t.node);
+    } else if (!inside && insideTriggers.has(t)) {
+      insideTriggers.delete(t);
+      if (!scripted) flash(`Left “${t.name}”`);
+      scripts?.triggerExit(t.node);
+    }
   }
+
+  interactFocus = active ? findInteractable() : null;
+  $('prompt').hidden = !interactFocus;
+  if (interactFocus) $('prompt-text').textContent = interactFocus.prompt;
 }
 
-// ------------------------------------------------------------------ third person
+// ------------------------------------------------------------------ view
 
-// yaw: camera heading (the camera looks along +Z rotated by yaw), body: character heading (it faces +Z rotated by body)
-const tp = { yaw: Math.PI, body: Math.PI, pitch: 0.3, dist: 4.5, curDist: 4.5, slide: new THREE.Vector2() };
 const view = { mode: readPref('view', 'first'), facing: readPref('facing', 'free') };
 let character = null;
-
-/** Character movement comes from its animation (Locomotion); the shared physics below adds gravity and collisions. */
-function moveThirdPerson(dt, ix, iz, running, steep) {
-  let input;
-  if (view.facing === 'strafe') {
-    // Body turns to the camera heading; A/D strafe and S walks backwards.
-    if (ix || iz) tp.body += angleTo(tp.body, tp.yaw) * (1 - Math.exp(-10 * dt));
-    const d = angleTo(tp.body, tp.yaw), c = Math.cos(d), s = Math.sin(d);
-    input = { x: ix * c + iz * s, z: iz * c - ix * s };
-  } else {
-    // Body turns toward where it's going and always walks forward.
-    if (ix || iz) tp.body += angleTo(tp.body, tp.yaw + Math.atan2(ix, iz)) * (1 - Math.exp(-8 * dt));
-    input = { x: 0, z: ix || iz ? 1 : 0 };
-  }
-  if (!player.onGround) input = { x: input.x * 0.3, z: input.z * 0.3 }; // limited air control
-  const v = character.update(dt, input, running);
-  const n = player.groundNormal;
-  if (steep) tp.slide.x += n.x * PLAYER.gravity * dt, tp.slide.y += n.z * PLAYER.gravity * dt;
-  else tp.slide.multiplyScalar(Math.exp(-10 * dt));
-  const c = Math.cos(tp.body), s = Math.sin(tp.body);
-  player.vel.x = v.z * s + v.x * c + tp.slide.x;
-  player.vel.z = v.z * c - v.x * s + tp.slide.y;
-}
-
-const _camTarget = new THREE.Vector3(), _camDir = new THREE.Vector3();
 const camRay = new THREE.Raycaster();
-
-function updateThirdPersonCamera(dt) {
-  const p = player.pos;
-  _camTarget.set(p.x, p.y + character.height * 0.85, p.z);
-  _camDir.set(-Math.sin(tp.yaw) * Math.cos(tp.pitch), Math.sin(tp.pitch), -Math.cos(tp.yaw) * Math.cos(tp.pitch));
-  // Pull in instantly when something is between the camera and the character; ease back out afterwards.
-  const free = Math.max(0.4, cameraClearance(_camTarget, _camDir, tp.dist) - 0.25);
-  tp.curDist = free < tp.curDist ? free : tp.curDist + (Math.min(free, tp.dist) - tp.curDist) * (1 - Math.exp(-4 * dt));
-  camera.position.copy(_camTarget).addScaledVector(_camDir, tp.curDist);
-  camera.lookAt(_camTarget);
-}
 
 /** Distance along the ray before it hits map geometry or the terrain (up to maxDist). */
 function cameraClearance(origin, dir, maxDist) {
@@ -307,40 +347,31 @@ function cameraClearance(origin, dir, maxDist) {
   return best;
 }
 
-function setView(mode) {
+/**
+ * First or third person (third needs a character). sticky: the map asks for it (the controller's "Start in"), so
+ * picking another character keeps it. The controller hears 'viewChanged' and turns its camera to match.
+ */
+function setView(mode, { sticky = false } = {}) {
+  if (mode !== 'first' && mode !== 'third') return;
+  if (sticky) spawnView = mode;
   if (mode === 'third' && !character) mode = 'first';
-  if (mode !== view.mode) {
-    const e = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
-    if (mode === 'third') {
-      tp.yaw = tp.body = e.y + Math.PI;
-      tp.curDist = 0.5; // zoom out from the eye
-    } else {
-      camera.quaternion.setFromEuler(new THREE.Euler(-tp.pitch * 0.5, tp.yaw + Math.PI, 0, 'YXZ'));
-    }
+  const changed = mode !== view.mode;
+  if (changed) {
     view.mode = mode;
     writePref('view', mode);
   }
-  controls.enabled = mode === 'first'; // PointerLockControls only steers the first-person camera
   if (character) character.root.visible = mode === 'third';
   $('crosshair').hidden = mode === 'third';
   syncViewUI();
+  if (changed) scripts?.game.emit('viewChanged', { mode });
 }
 
 function setFacing(facing) {
+  if (facing !== 'free' && facing !== 'strafe') return;
   view.facing = facing;
   writePref('facing', facing);
   syncViewUI();
 }
-
-document.addEventListener('mousemove', (e) => {
-  if (!controls.isLocked || view.mode !== 'third') return;
-  tp.yaw -= e.movementX * 0.0025;
-  tp.pitch = THREE.MathUtils.clamp(tp.pitch + e.movementY * 0.0025, -0.5, 1.25);
-});
-window.addEventListener('wheel', (e) => {
-  if (view.mode !== 'third') return;
-  tp.dist = THREE.MathUtils.clamp(tp.dist * Math.exp(e.deltaY * 0.001), 1.2, 14);
-}, { passive: true });
 
 // ------------------------------------------------------------------ character picker
 
@@ -350,6 +381,11 @@ function readPref(key, fallback) {
 function writePref(key, value) {
   try { localStorage.setItem(`playtest.${key}`, value); } catch { /* private mode */ }
 }
+
+/** The editor's animation clip library, handed over by ▶ Play (null outside a playtest). Re-read on reload. */
+let clipsPromise = null;
+const playtestClips = () => (clipsPromise ??= new URLSearchParams(location.search).has('playtest')
+  ? idbGet('playtest-clips').catch(() => null) : Promise.resolve(null));
 
 let charSpec = { kind: 'capsule' };
 let tinyChars = [];
@@ -362,9 +398,10 @@ async function selectCharacter(spec, { switchToThird = true } = {}) {
   renderCharacterTiles();
   setCharMsg(`Loading ${spec.name ?? 'character'}…`);
   try {
+    const clips = await playtestClips();
     const next = spec.kind === 'map'
-      ? await loadCharacter({ kind: 'file', name: mapPlayer.name, buffer: mapPlayer.buffer }, renderer)
-      : await loadCharacter(spec, renderer);
+      ? await loadCharacter({ kind: 'file', name: mapPlayer.name, buffer: mapPlayer.buffer }, renderer, { clips })
+      : await loadCharacter(spec, renderer, { clips });
     if (spec.kind === 'map') {
       next.setHeight(mapPlayer.height);
       next.equip(mapPlayer.parts);
@@ -376,6 +413,7 @@ async function selectCharacter(spec, { switchToThird = true } = {}) {
     const { kind, ...saved } = spec;
     if (kind !== 'map') writePref('character', JSON.stringify(kind === 'file' ? { kind, name: spec.name } : { kind, ...saved }));
     setCharMsg(describeCharacter(character));
+    renderActions();
     setView(spawnView ?? (switchToThird ? 'third' : view.mode));
   } catch (err) {
     if (token !== charLoadToken) return;
@@ -387,7 +425,16 @@ async function selectCharacter(spec, { switchToThird = true } = {}) {
 function describeCharacter(c) {
   const anim = { locomotion: 'tinyimgen locomotion (6 mocap clips)', clips: 'idle/walk/run clips by name', static: 'no animations', capsule: 'no animations' }[c.kind];
   const holds = c.held.length ? ` · holding ${c.held.map((h) => h.holder.userData.name ?? h.holder.name).join(', ')}` : '';
-  return `${c.name} · ${c.height.toFixed(2)} m · ${anim}${holds}`;
+  const lib = c.libraryClips ? ` · ${c.libraryClips} clip${c.libraryClips === 1 ? '' : 's'} from the editor` : '';
+  return `${c.name} · ${c.height.toFixed(2)} m · ${anim}${lib}${holds}`;
+}
+
+/** The HUD's list of clips on the number keys. */
+function renderActions() {
+  const el = $('hud-actions');
+  const list = character?.actions ?? [];
+  el.hidden = !list.length;
+  el.replaceChildren(...list.flatMap((c, i) => [i ? ' · ' : '', Object.assign(document.createElement('kbd'), { textContent: i + 1 }), ` ${c.name}`]));
 }
 
 function setCharMsg(text, error = false) {
@@ -470,19 +517,33 @@ async function initCharacters() {
 }
 
 let flashTimer;
-function flash(msg) {
+function flash(msg, ms = 2000, error = false) {
   const el = $('event');
   el.textContent = msg;
+  el.classList.toggle('error', error);
   el.style.display = 'block';
   clearTimeout(flashTimer);
-  flashTimer = setTimeout(() => { el.style.display = 'none'; }, 2000);
+  flashTimer = setTimeout(() => { el.style.display = 'none'; }, ms);
 }
 
 // ------------------------------------------------------------------ UI / loop
 
-$('play').addEventListener('click', () => controls.lock());
-controls.addEventListener('lock', () => { $('overlay').style.display = 'none'; });
-controls.addEventListener('unlock', () => { $('overlay').style.display = 'flex'; $('play').textContent = 'Resume'; });
+// No "click to play": a loaded map plays straight away with the keyboard. Clicking the game captures the mouse for
+// looking around; Esc frees it and opens the menu (character, view), whose Resume captures it again.
+let menuOpen = false;
+function setMenu(open) {
+  menuOpen = open;
+  $('overlay').style.display = open ? 'flex' : 'none';
+  syncMouseHint();
+}
+function gameHasInput() { return !menuOpen && !!map && document.hasFocus(); }
+function syncMouseHint() { $('mouse-hint').hidden = menuOpen || !map || controls.isLocked; }
+if (embedded) $('mouse-hint').innerHTML = 'Click to look around · <kbd>Esc</kbd> stops'; // in the editor, Esc with the mouse free stops
+$('play').addEventListener('click', () => { setMenu(false); controls.lock(); });
+renderer.domElement.addEventListener('click', () => { if (!menuOpen && map && !controls.isLocked) controls.lock(); });
+controls.addEventListener('lock', () => { setMenu(false); toEditor('locked', { locked: true }); });
+// In a tab Esc brings up the menu; in the editor's play mode it only frees the mouse (Esc again stops).
+controls.addEventListener('unlock', () => { if (map && !embedded) setMenu(true); syncMouseHint(); toEditor('locked', { locked: false }); });
 $('file').addEventListener('change', async (e) => {
   const f = e.target.files[0];
   if (f) await loadMapBuffer(await f.arrayBuffer(), f.name);
@@ -504,7 +565,8 @@ timer.connect(document);
 renderer.setAnimationLoop((t) => {
   perf.begin();
   timer.update(t);
-  update(Math.min(timer.getDelta(), 0.05));
+  const dt = Math.min(timer.getDelta(), 0.05);
+  if (!paused) update(dt);
   renderer.render(scene, camera);
   perf.end();
 });
@@ -512,20 +574,40 @@ renderer.setAnimationLoop((t) => {
 syncViewUI();
 initCharacters();
 // Handy for console tinkering (like window.editor in the editor).
-window.playtest = { player, PLAYER, view, tp, controls, keys, camera, get map() { return map; }, get character() { return character; }, setView, selectCharacter };
+window.playtest = { player, BODY, view, controls, keys, camera, get map() { return map; }, get character() { return character; }, get scripts() { return scripts; }, setView, selectCharacter };
+
+const params = new URLSearchParams(location.search);
+
+// The editor re-exports the playtest when a prop it uses is re-saved in tinyimgen; pick that up in place.
+if (params.has('playtest')) {
+  let reloading = Promise.resolve();
+  new BroadcastChannel('3dmap-playtest').onmessage = ({ data }) => {
+    if (data?.type !== 'reload') return;
+    reloading = reloading.then(async () => {
+      clipsPromise = null; // the editor may have changed its clips too
+      const buf = await idbGet('playtest');
+      if (buf) await loadMapBuffer(buf, 'Playtest', { playtest: true, keep: !!map });
+      if (charSpec.kind !== 'map' && charSpec.kind !== 'capsule') await selectCharacter(charSpec, { switchToThird: false });
+    }).catch((err) => console.error('playtest reload failed', err));
+  };
+}
 
 (async () => {
-  const params = new URLSearchParams(location.search);
+  // Opened to play a map (▶ Play, ↗, ?map=): straight in, with no card. Opened on its own: the card, to load a .glb.
+  const auto = params.has('playtest') || !!params.get('map');
+  if (!auto) { setMenu(true); return; }
+  $('loading').hidden = false;
   try {
-    if (params.has('playtest')) {
-      const buf = await idbGet('playtest');
-      if (buf) await loadMapBuffer(buf, 'Playtest', { playtest: true });
-    } else if (params.get('map')) {
-      const res = await fetch(params.get('map'));
-      await loadMapBuffer(await res.arrayBuffer(), params.get('map'));
-    }
+    let buf = null;
+    if (params.has('playtest')) buf = await idbGet('playtest');
+    else buf = await (await fetch(params.get('map'))).arrayBuffer();
+    if (!buf) throw new Error('nothing to play: press ▶ Play in the editor');
+    await loadMapBuffer(buf, params.has('playtest') ? 'Playtest' : params.get('map'), { playtest: params.has('playtest') });
   } catch (err) {
     console.error(err);
     $('subtitle').textContent = `Failed to load map: ${err.message}`;
+    setMenu(true);
+  } finally {
+    $('loading').hidden = true;
   }
 })();

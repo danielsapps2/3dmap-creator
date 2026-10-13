@@ -8,13 +8,15 @@ export const PROJECT_FORMAT = '3dmap-creator-project';
 export function serializeProject(editor) {
   return {
     format: PROJECT_FORMAT,
-    version: 4,
+    version: 5,
     name: editor.mapName,
     savedAt: new Date().toISOString(),
     environment: { ...editor.env },
     terrain: editor.terrain.toJSON(),
-    assets: editor.assets.list().map((a) => ({ id: a.id, name: a.fileName, buffer: a.buffer, meta: a.meta })),
+    assets: editor.assets.list().map((a) => ({ id: a.id, name: a.fileName, path: a.path, buffer: a.buffer, meta: a.meta })),
     objects: editor.objects.map(serializeEntity), // parents before children; transforms are local to the parent
+    clips: editor.clips?.toJSON() ?? [], // the shared animation library (v5), so a project carries its clips along
+    scripts: editor.scripts?.toJSON() ?? [], // the map's scripts (v5); objects refer to them by id
     camera: { position: editor.camera.position.toArray(), target: editor.orbit.target.toArray() },
     settings: {
       snap: { ...editor.snap },
@@ -25,18 +27,23 @@ export function serializeProject(editor) {
   };
 }
 
-export async function loadProject(editor, data, { onWarning = console.warn } = {}) {
+/**
+ * mergeClips: add the file's animation clips to the shared library. The autosave skips it: the library keeps its
+ * own, newer copy in IndexedDB.
+ */
+export async function loadProject(editor, data, { onWarning = console.warn, mergeClips = true } = {}) {
   if (data?.format !== PROJECT_FORMAT) throw new Error('Not a 3D Map Creator project file');
   editor.clearAll();
   editor.mapName = data.name ?? 'Untitled Map';
   editor.env = { ...DEFAULT_ENV, ...data.environment };
+  editor.scripts?.load(data.scripts ?? []);
   const repaired = editor.terrain.fromJSON(data.terrain);
   if (repaired) onWarning(`Repaired ${repaired} invalid terrain height${repaired === 1 ? '' : 's'}`);
   editor.applyEnvironment();
 
   for (const a of data.assets ?? []) {
     try {
-      await editor.assets.add(a.name, a.buffer, a.id, a.meta);
+      await editor.assets.add(a.name, a.buffer, a.id, a.meta, a.path ?? null);
     } catch (err) {
       onWarning(`Could not load asset "${a.name}": ${err.message}`);
     }
@@ -67,6 +74,7 @@ export async function loadProject(editor, data, { onWarning = console.warn } = {
     editor.setSnap(data.settings.snap ?? {});
     if (Number.isFinite(data.settings.flySpeed)) editor.fly.speed = Math.min(500, Math.max(1, data.settings.flySpeed));
   }
+  if (mergeClips) editor.clips?.merge(data.clips);
   editor.history.clear();
   editor.emit('sceneChanged');
   editor.emit('terrainChanged');

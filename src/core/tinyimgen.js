@@ -41,6 +41,9 @@ export async function listTinyimgenCharacters() {
   return (await listTinyimgen()).characters;
 }
 
+/** A prop's current files. The Prop Editor rewrites both on every save (prop.glb's grip nodes come from grip.json). */
+export const propFiles = (id) => ({ url: `${TINYIMGEN}/media/3d/${id}/prop.glb`, gripUrl: `${TINYIMGEN}/media/3d/${id}/grip.json` });
+
 /** Download a file from tinyimgen, revalidating so a re-rig or re-saved grip shows up. */
 export async function fetchTinyimgen(url, as = 'arrayBuffer') {
   const res = await fetch(url, { cache: 'no-cache' });

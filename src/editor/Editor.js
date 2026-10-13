@@ -6,9 +6,9 @@ import { History } from './History.js';
 import { AssetLibrary } from './AssetLibrary.js';
 import {
   createEntity, serializeEntity, applyEntityState, disposeEntity, isEditorOnly, entityBounds, buildEntities,
-  childEntities, entitySubtree, parentEntity, findOwn, isWithin, isShown,
+  childEntities, entitySubtree, parentEntity, findOwn, isWithin, isShown, assetModel, refreshEntity,
 } from './Entities.js';
-import { poseCharacter, gripTransform, entityRig, entityProp, socketForHand } from './Rig.js';
+import { poseCharacter, gripTransform, entityRig, entityProp, socketForHand, isHandSocket } from './Rig.js';
 import { uid } from '../core/utils.js';
 
 export const DEFAULT_ENV = {
@@ -501,6 +501,35 @@ export class Editor extends EventTarget {
     return model;
   }
 
+  /**
+   * Load a new version of an asset (a prop re-saved in tinyimgen's Prop Editor) into the library and every placed
+   * copy, keeping their transforms and children. Held props that sat on their old grip are snapped onto the new
+   * one; ones moved off it by hand stay where they are. Not an undo step: it's the source file that changed.
+   */
+  async reloadAsset(id, buffer, meta) {
+    const users = this.objects.filter((o) => o.entity.kind === 'asset' && o.entity.assetId === id);
+    const onGrip = new Set(users.filter((o) => {
+      if (!isHandSocket(o.entity.attach)) return false;
+      const t = gripTransform(o);
+      return t && t.position.distanceTo(o.position) < 1e-3 && t.quaternion.angleTo(o.quaternion) < 1e-3;
+    }));
+    await this.assets.replace(id, buffer, meta);
+    for (const o of users) {
+      const old = assetModel(o);
+      const model = this.assets.instantiate(id);
+      o.add(model);
+      if (old) {
+        this._place(model, o, o.children.indexOf(old));
+        o.remove(old);
+      }
+      refreshEntity(o);
+      if (onGrip.has(o)) this._snapGrip(o);
+    }
+    this.emit('sceneChanged');
+    this._statesChanged(users);
+    return users.length;
+  }
+
   /** Re-pose characters on the next frame (live previews of hold edits that aren't committed yet). */
   requestPose() { this._posesDirty = true; }
 
@@ -831,6 +860,7 @@ export class Editor extends EventTarget {
       disposeEntity(obj);
     }
     this.assets.clear();
+    this.scripts?.clear();
     this.terrain.restore(Terrain.blankSnapshot(128, 128));
     this.terrain.material.roughness = 0.95;
     this.terrain.setFlatShading(false);
@@ -977,6 +1007,12 @@ export class Editor extends EventTarget {
     return hit ? hit.point.y : null;
   }
 
+  /** The object under a screen point (e.g. where something was dropped). */
+  pickAt(event) {
+    this._updatePointer(event);
+    return this.pickObject();
+  }
+
   pickObject() {
     this._setRayFromPointer();
     const hit = this._firstValidHit(this.raycaster.intersectObjects(this.roots, true), true);
@@ -1042,6 +1078,7 @@ export class Editor extends EventTarget {
   }
 
   _onFlyKey(e, down) {
+    if (this.paused) return;
     this.fly.boost = e.shiftKey;
     if (!down) { this.fly.keys.delete(e.code); return; }
     const dir = FLY_KEYS[e.code];
@@ -1244,6 +1281,13 @@ export class Editor extends EventTarget {
     this.updatePoses();
     if (this.selection.length) this._updateSelectionBoxes();
     this.renderer.render(this.scene, this.camera);
+  }
+
+  /** Stop drawing (and flying) while another full-screen view, like the animation editor, covers the viewport. */
+  setPaused(paused) {
+    this.paused = paused;
+    this.fly.keys.clear();
+    this.renderer.setAnimationLoop(paused ? null : (t) => this._tick(t));
   }
 
   _resize() {

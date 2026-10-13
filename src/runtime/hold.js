@@ -46,12 +46,15 @@ export function heldProp(holder, socket, data = null) {
  * Apply the saved hold to `character` (the model with the bones) after its animation update: the static carry
  * pose, or the ready pose for two-handed props, then the support hand on the second grip and the finger curls.
  * `height` is the character's height in its model units (carry poses are stored in character heights).
+ * arms: false leaves the arms to the animation (a clip like a sword swing) and only curls the fingers.
  */
-export function poseHeld(character, held, height) {
+export function poseHeld(character, held, height, { arms = true } = {}) {
   const d = held.data;
-  if (d.arms === 'static' && d.carry) carryPose(character, held, d.carry, height);
-  else if (held.secondary) readyPose(character, held, d.hold ?? held.root.userData?.hold ?? 'upright');
-  if (held.secondary) solveSupportHand(character, held);
+  if (arms) {
+    if (d.arms === 'static' && d.carry) carryPose(character, held, d.carry, height);
+    else if (held.secondary) readyPose(character, held, d.hold ?? held.root.userData?.hold ?? 'upright');
+    if (held.secondary) solveSupportHand(character, held);
+  }
   setFingers(character, held.hand, d.fingers?.primary ?? DEFAULT_FINGERS);
   if (held.secondary) setFingers(character, held.other, d.fingers?.secondary ?? DEFAULT_FINGERS);
 }

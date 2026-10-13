@@ -11,8 +11,12 @@ import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { Locomotion } from './locomotion.js';
 import { fetchTinyimgen } from '../core/tinyimgen.js';
 import { heldProp, poseHeld, findNamed } from '../runtime/hold.js';
+import { rigOf, bakeClip, isLocomotion, sampleLocal, hipsOffset } from '../anim/clips.js';
 
 const DEFAULT_HEIGHT = 1.8;
+const ACTION_FADE = 0.2; // s to blend into and out of a library clip
+const STILL = { x: 0, z: 0 };
+const _q = new THREE.Quaternion(), _v = new THREE.Vector3();
 
 let loader = null;
 function getLoader(renderer) {
@@ -28,9 +32,11 @@ function getLoader(renderer) {
 
 /**
  * spec: { kind: 'capsule' } | { kind: 'tinyimgen', id, name, url } | { kind: 'file', name, buffer }
+ * clips: the editor's animation library (anim/clips.js). On a tinyimgen skeleton, clips named like a locomotion
+ * clip (Walk, Idle…) replace the model's own, and the rest become actions (playAction) for the number keys.
  * Returns a Character whose `root` has its feet at the origin, facing +Z.
  */
-export async function loadCharacter(spec, renderer) {
+export async function loadCharacter(spec, renderer, { clips = null } = {}) {
   if (spec.kind === 'capsule') return new Character(makeCapsule(), new SimpleAnimator(), { name: 'Capsule', kind: 'capsule' });
   let buffer = spec.buffer;
   if (spec.kind === 'tinyimgen') {
@@ -44,6 +50,13 @@ export async function loadCharacter(spec, renderer) {
       if (o.isSkinnedMesh) o.frustumCulled = false; // bind-pose bounds don't follow the animation
     }
   });
+  const rig = clips?.length ? rigOf(model) : null; // read before anything poses it
+  if (rig) {
+    for (const clip of clips.filter(isLocomotion)) {
+      const baked = bakeClip(clip, rig), i = gltf.animations.findIndex((a) => a.name === clip.name);
+      if (i >= 0) gltf.animations[i] = baked; else gltf.animations.push(baked);
+    }
+  }
   const scale = normalize(model);
   let animator, kind;
   try {
@@ -53,7 +66,13 @@ export async function loadCharacter(spec, renderer) {
     animator = new SimpleAnimator(gltf.animations, model);
     kind = gltf.animations.length ? 'clips' : 'static';
   }
-  return new Character(model, animator, { name: spec.name, kind, speedScale: scale });
+  const character = new Character(model, animator, { name: spec.name, kind, speedScale: scale });
+  if (rig) {
+    character.rig = rig;
+    character.actions = clips.filter((c) => !isLocomotion(c)).slice(0, 9);
+    character.libraryClips = clips.length;
+  }
+  return character;
 }
 
 /** Feet at y = 0, centered on X/Z; rescale models that are clearly not in meters. Returns the scale applied. */
@@ -98,6 +117,36 @@ export class Character {
     this.kind = kind; // 'locomotion' | 'clips' | 'static' | 'capsule'
     this.speedScale = speedScale;
     this.height = new THREE.Box3().setFromObject(this.root).getSize(new THREE.Vector3()).y || DEFAULT_HEIGHT;
+    this.rig = null;        // tinyimgen skeleton (anim/clips.js rigOf), when library clips apply
+    this.actions = [];      // library clips on the number keys
+    this.libraryClips = 0;
+    this.acting = null;     // the action playing: { clip, time, weight, ending }
+  }
+
+  /**
+   * Play action i (a library clip) over the locomotion: the character stands still while it plays. A one-shot
+   * clip fades out at its end; a looping one plays until the character moves or the same key is pressed again.
+   * Returns the clip, or null if there's none on that key.
+   */
+  playAction(i) {
+    const clip = this.actions[i];
+    if (!clip) return null;
+    if (this.acting?.clip === clip && !this.acting.ending) this.acting.ending = true;
+    else this.acting = { clip, time: 0, weight: this.acting?.weight ?? 0, ending: false };
+    return clip;
+  }
+
+  _blendAction(dt) {
+    const a = this.acting;
+    a.time += dt;
+    if (!a.clip.loop && a.time >= a.clip.duration - ACTION_FADE) a.ending = true;
+    a.weight = THREE.MathUtils.clamp(a.weight + (a.ending ? -dt : dt) / ACTION_FADE, 0, 1);
+    if (a.ending && a.weight <= 0) { this.acting = null; return; }
+    const t = a.clip.loop ? a.time % a.clip.duration : Math.min(a.time, a.clip.duration);
+    const pose = sampleLocal(a.clip, t, this.rig, (this._pose ??= {})); // fitted to this character's skeleton
+    for (const [name, bone] of Object.entries(this.rig.bones)) bone.quaternion.slerp(pose[name], a.weight);
+    hipsOffset(a.clip, t, _v).multiplyScalar(this.rig.hipsHeight).add(this.rig.restHips);
+    this.rig.bones.Hips.position.lerp(_v, a.weight);
   }
 
   /** Resize to a height in metres (the model's height in the editor). Animation speed scales along with it. */
@@ -128,9 +177,13 @@ export class Character {
 
   /** input: { x: left(+)/right(-), z: forward(+)/back(-) }. Returns local velocity in m/s. */
   update(dt, input, running) {
-    const v = this.animator.update(dt, input, running);
-    // carry poses are in character heights, measured in the model's own units
-    for (const held of this.held) poseHeld(this.model, held, this.height / this.speedScale);
+    const act = this.acting;
+    if (act?.clip.loop && !act.ending && (input.x || input.z)) act.ending = true; // walking off ends a looping clip
+    const v = this.animator.update(dt, act && !act.ending ? STILL : input, running);
+    if (this.acting) this._blendAction(dt);
+    // carry poses are in character heights, measured in the model's own units; during an action the clip has the arms
+    const arms = !this.acting || this.acting.weight < 0.5;
+    for (const held of this.held) poseHeld(this.model, held, this.height / this.speedScale, { arms });
     return { x: v.x * this.speedScale, z: v.z * this.speedScale, speed: v.speed * this.speedScale };
   }
 

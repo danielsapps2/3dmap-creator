@@ -156,6 +156,39 @@ export function toast(message, { type = 'info', timeout = 3200, action } = {}) {
   return t;
 }
 
+/** A right-click menu at (x, y). items: [label, fn, { disabled, danger }] or '-' (a separator). */
+export function contextMenu(x, y, items) {
+  document.querySelectorAll('.ctx-menu').forEach((m) => m.remove());
+  const menu = h('div', { class: 'ctx-menu menu-dd', style: { display: 'block', position: 'fixed', left: `${x}px`, top: `${y}px` } },
+    ...items.filter(Boolean).map((it) => (it === '-' ? h('hr') : h('button', {
+      class: `menu-item${it[2]?.danger ? ' danger' : ''}`, disabled: !!it[2]?.disabled,
+      onclick: () => { close(); it[1](); },
+    }, h('span', {}, it[0])))));
+  const close = () => { menu.remove(); document.removeEventListener('pointerdown', away, true); window.removeEventListener('keydown', esc, true); };
+  const away = (e) => { if (!menu.contains(e.target)) close(); };
+  const esc = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  document.body.append(menu);
+  const r = menu.getBoundingClientRect(); // keep it on screen
+  if (r.right > innerWidth) menu.style.left = `${Math.max(4, innerWidth - r.width - 4)}px`;
+  if (r.bottom > innerHeight) menu.style.top = `${Math.max(4, innerHeight - r.height - 4)}px`;
+  setTimeout(() => { document.addEventListener('pointerdown', away, true); window.addEventListener('keydown', esc, true); });
+  return close;
+}
+
+/** Ask for a line of text. Resolves the text, or null if cancelled. */
+export function prompt(title, { value = '', label = '', ok = 'OK' } = {}) {
+  return new Promise((resolve) => {
+    const input = h('input', { type: 'text', value, class: 'prompt-input' });
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    const close = modal(title, h('div', {}, label ? h('p', {}, label) : null, input), {
+      actions: [{ label: 'Cancel', run: () => finish(null) }, { label: ok, cls: 'btn-primary', run: () => finish(input.value.trim() || null) }],
+    });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { finish(input.value.trim() || null); close(); } });
+    setTimeout(() => { input.focus(); input.select(); });
+  });
+}
+
 export function modal(title, body, { actions = [] } = {}) {
   const close = () => backdrop.remove();
   const backdrop = h('div', { class: 'modal-backdrop', onclick: (e) => { if (e.target === backdrop) close(); } },

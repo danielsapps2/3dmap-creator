@@ -366,9 +366,10 @@ export function autoWrap(character, side, propRoot, { margin = 0.03 } = {}) {
 }
 
 // ---------- static carry ----------
-// carry = {position: [x, y, z] in units of the character's height, rotation: [x, y, z, w]}: where the prop's root
-// sits relative to the character's UpperChest bone, so the prop rides with the torso (bob, twist, lean) and the
-// arms always reach it. The holding arm (and the support arm, for two-handed props) reach it.
+// carry = {position: [x, y, z] in units of the character's height, rotation: [x, y, z, w], of: "grip"}: where the
+// holding hand's grip (Grip_Primary, i.e. the hand socket) sits relative to the character's UpperChest bone, so the
+// hand rides with the torso (bob, twist, lean). Carry and grip are independent: the carry places the hand, the grip
+// places the prop in the hand. (Older grips without `of` stored the Prop root's place instead; still read.)
 export const CARRY_BONE = "UpperChest";
 export function carryPose(character, held, carry, height) {
   if (!carry) return false;
@@ -379,7 +380,7 @@ export function carryPose(character, held, carry, height) {
   const chest = character.getObjectByName(CARRY_BONE) || character;
   target.premultiply(chest.matrixWorld);
   held.grip.updateMatrix();
-  const sock = target.clone().multiply(held.grip.matrix);
+  const sock = carry.of === "grip" ? target : target.clone().multiply(held.grip.matrix);
   const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scl = new THREE.Vector3();
   sock.decompose(pos, quat, scl);
   return reachSocket(character, held.hand, comfortable(character, held, pos, quat, 0.92), quat);

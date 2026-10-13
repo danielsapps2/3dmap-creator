@@ -357,6 +357,7 @@ export function outliner(root, editor) {
       const r = h('div', {
         class: `ol-row${editor.isSelected(o) ? ' selected' : ''}${o.visible ? '' : ' hidden'}`,
         style: `padding-left: ${4 + depth * 14}px`,
+        'data-entity': o.entity.id, // scripts dragged from the Files tab attach to the row they're dropped on
         draggable: true,
         onclick: (e) => click(e, o),
         ondblclick: () => editor.focus(o),

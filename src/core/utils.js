@@ -36,6 +36,28 @@ export function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
+/**
+ * Ask where to save, then write the blob there. Falls back to a plain download in browsers without the
+ * File System Access API (Firefox, Safari). Resolves false if the user cancels the dialog.
+ */
+export async function saveBlobAs(makeBlob, filename, { description, accept } = {}) {
+  if (!window.showSaveFilePicker) {
+    downloadBlob(makeBlob(), filename);
+    return true;
+  }
+  let handle;
+  try {
+    handle = await window.showSaveFilePicker({ id: 'save', suggestedName: filename, types: accept ? [{ description, accept }] : undefined });
+  } catch (err) {
+    if (err.name === 'AbortError') return false;
+    throw err;
+  }
+  const writable = await handle.createWritable();
+  await writable.write(makeBlob());
+  await writable.close();
+  return true;
+}
+
 export function pickFiles(accept, multiple = false) {
   return new Promise((resolve) => {
     const input = document.createElement('input');

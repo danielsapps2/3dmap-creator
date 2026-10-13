@@ -20,7 +20,7 @@ npm run build      # static build in dist/
 | **tinyimgen** | The Models tab lists tinyimgen's rigged characters and holdable props (see [Characters and held props](#characters-and-held-props)). Click one to place it. |
 | **Game data** | Per-object collider type (box, ramp, sphere, mesh, trigger), static flag, tags, custom key/value properties. Ramps and stairs default to the walkable `ramp` collider. These are exported as glTF extras, so in three.js they show up in `object.userData`. |
 | **Editing** | Multi-select (Shift/Ctrl+click, box-drag, Ctrl+A, outliner ranges) and transform, duplicate, delete, drop or snap the whole selection together. Hold **Shift while scaling** to scale one side only. Hold **Alt while dragging** the gizmo to duplicate and drag the copy. Move/rotate/scale gizmo with grid snapping (objects snap by their bounding-box edges, so any size lines up with the grid and each other; markers snap by their pivot; move step = grid cell, rotate step in degrees, scale step), hold Ctrl to toggle snapping temporarily, snap-to-grid for existing objects, and a grid drawn on the terrain surface. Also: undo/redo, duplicate, drop-to-ground, outliner, autosave to IndexedDB. |
-| **Output** | `.glb` / `.gltf` map, layout JSON (transforms + heights only), project file (`.map.json`, embeds models), heightmap PNG, and **▶ Play** opens a first-person playtest. |
+| **Output** | `.glb` / `.gltf` map, layout JSON (transforms + heights only), project folder (scripts as `.js` files, for VS Code) or single project file (`.map.json`, embeds models), heightmap PNG. **▶ Play** runs a playtest inside the editor (**↗** opens it in a tab). |
 
 ## Controls
 
@@ -104,7 +104,109 @@ for (const h of map.held) {                       // { node, parent, bone, attac
 }
 ```
 
-### Playtest (▶ Play)
+### Project folders and the Files tab
+
+In Chrome and Edge, a project is a folder of ordinary files, so you can open it in VS Code or keep it in git:
+
+```
+My map/
+  project.json                the map: environment, objects (with their scripts' params), camera, settings, and an index of the files
+  scripts/**/Door.js          one file per script (subfolders are fine)
+  assets/**/knight.glb        the models
+  clips/**/Wave.clip.json     one file per animation clip
+  terrain/heights.f32, terrain/colors.f32   the terrain grid (raw Float32)
+```
+
+**File → Save project** (`Ctrl+S`) picks the folder the first time, and **Open project folder…** (`Ctrl+O`) opens one. From then on, scripts, models and clips are **written as soon as they change**: a new or renamed script, an imported model, an edited clip. `Ctrl+S` saves the map itself (`project.json` and the terrain). Without a folder, the same files live in the editor (and its autosave) until the first save.
+
+The **Files** tab shows them:
+
+- **scripts/**: double-click to edit. Drag a script onto an object in the viewport, a row in the Scene list, or the Inspector to attach it. Right-click for New, New from template, Import .js, Rename, Duplicate or Delete.
+- **assets/**: click a model to place it. Right-click to import, rename or delete (deleting also removes its placed copies).
+- **clips/**: double-click to open in the animation editor. Right-click to rename, duplicate or delete.
+- **Engine**: what the editor provides, which is the script templates and the tinyimgen models. Using one copies it into the project: clicking or dragging a template writes `scripts/<Template>.js` (the Inspector's **+ Add script…** offers them too), and clicking a tinyimgen model writes it to `assets/` and places it.
+
+The editor watches the folder while it's open. Scripts and clips saved, added (including in subfolders) or deleted outside the editor show up, and a GLB dropped into `assets/` becomes a model (replacing one updates its placed copies). A script you save in VS Code reloads the running game. Writes never overwrite a file that changed on disk unless the editor changed it too, and if both changed you're told. If `project.json` changes on disk, the editor offers to reload the project. After a page reload the editor reconnects to the folder (the browser may ask again) and takes script edits made while it was closed. The status bar shows the open folder.
+
+The single-file format (`.map.json`, everything embedded) is still under **File → Open / Save as single file**, and it's what other browsers use. Folders saved with the older `clips.json` still open.
+
+### Scripts
+
+Scripts are JavaScript files in the project's `scripts/` folder (see the **Files** tab above): classes you attach to objects, like components in Unity. Start one from an engine template (Spin, Bob, Door, Pickup, Message zone, Flicker, Animate, NPC states, Moving platform, Player controller, or Empty), edit it in the built-in code editor (autocomplete for `this.` and `this.game.`, with an API reference next to the code) or in VS Code, and attach it by dragging it onto an object or from the object's Inspector. A script's `params` become fields in the Inspector, and each object keeps its own values.
+
+```js
+export const params = {
+  speed: { type: 'number', default: 90, label: 'Speed (°/s)' },  // also: text, bool, color, select (with options)
+};
+
+export default class Spin {
+  start() {}                     // once, before the first update
+  update(dt) { this.object.rotation.y += this.THREE.MathUtils.degToRad(this.params.speed) * dt; }
+  // onTriggerEnter(player) / onTriggerExit(player)  on a Trigger Volume, when the player walks in or out
+  // onInteract(player)          the player pressed E nearby (this.prompt sets the hint: "E · Open")
+  // onDestroy()
+}
+```
+
+Each instance has `this.object` (its node in the loaded map), `this.params`, `this.THREE`, and `this.game`: `time`, `player` (`position`, `teleport()`, `playClip(name)` for animation library clips), `find(name)`, `findByTag(tag)`, `message(text)`, `input.isDown(code)` / `input.pressed(code)`, `on(event, fn)` / `emit(event, data)` (a Trigger Volume's event name fires when the player enters it), `destroy(object)`, `setCollidable(object, on)` and `distanceToPlayer(object)`. Colliders follow objects that scripts move. Scripts can't `import`.
+
+Scripts run in the playtest, and saving one reloads an open playtest tab. A script that throws is stopped and reported on screen, and the others keep running. They're saved in the project and exported inside the map GLB, so your game can run them with the drop-in `src/runtime/scripts.js` (next to `MapLoader.js`):
+
+```js
+import { runScripts } from './scripts.js';
+const scripts = await runScripts(map, { player: { position: playerFeet }, message: (text) => showOnHud(text) });
+// every frame: scripts.update(dt). When the player enters or leaves a trigger: scripts.triggerEnter(t.node) / triggerExit(t.node).
+// "use" key: scripts.interactables() lists [{ node, prompt }]; call scripts.interact(node).
+```
+
+Scripts are code that runs in the page with full access to it, so only run maps whose scripts you trust.
+
+#### Animation states
+
+Any tinyimgen character in the map can be animated from a script. It can play clips from the animation library, which is exported inside the map, as well as the characters' own Idle, Walk and Run. A `clip` param shows up in the Inspector as a dropdown of those clips.
+
+```js
+const anim = this.game.animator(this.object);              // null if it isn't a tinyimgen character
+anim.play('Salute', { fade: 0.25 }).then(() => anim.play('Idle'));   // a one-shot's promise resolves when it ends
+
+this.fsm = this.game.stateMachine({                        // updated every frame for you
+  object: this.object,
+  initial: 'idle',
+  states: {
+    idle:    { clip: 'Idle', update: () => (this.game.distanceToPlayer(this.object) < 3 ? 'greet' : null) },
+    greet:   { clip: 'Salute', loop: false, next: 'idle', enter: () => this.game.message('Hello!') },
+    sitting: { clip: 'Sitting Idle' },
+  },
+});
+this.fsm.go('sitting');                                    // or switch from anywhere
+```
+
+A state can have `clip`, `loop`, `fade` and `speed`. It can also have `enter(sm, data)` and `exit(sm)`, and `update(dt, sm)`, which switches state when it returns a state's name. `next` moves to another state when a one-shot clip ends, or after `duration` seconds. A character holding a prop keeps its grip while it animates. The *Animate* and *NPC states* templates show both. For your own game, use `src/runtime/animator.js` (`Animator`, `createStateMachine`).
+
+#### Player controller
+
+How the player moves is a script too, and its params are the movement and camera settings. In the Player Spawn's Inspector, **Make a player controller script** turns the built-in controller into this map's own script. The spawn's current settings carry over, and the spawn's Movement and Camera fields give way to the script's. You can change the code freely: speeds, jumping, air control, the first-person and third-person cameras, mouse look, and the V / T / R / Space keys. It uses `this.game.physics.move(dt, { radius, height, step, maxSlope })` for collisions, plus `this.game.view`, `this.game.input.mouse` and `this.game.player`.
+
+A script becomes the controller by exporting `controlsPlayer = true`. Maps without a controller, including older maps, run the default one (`src/runtime/PlayerController.script.js`) with the spawn's settings. If a controller crashes, the default takes over, so the player can still move.
+
+### Animation editor (🎬 Animate)
+
+A keyframe editor for tinyimgen characters. Every tinyimgen rig has the same skeleton with unrotated rest joints, so a clip made on one character plays on all of them. Each clip remembers the skeleton it was made on, and on another character it's fitted to that body's proportions (bone by bone, lining up the rest directions), so arms and legs land where they should. In the game, characters use their own Idle, Walk and Run unless the library has a clip by that name. Clips live in one shared library: it's kept in the browser, saved inside project files (opening a project adds its clips), and handed to the playtest by ▶ Play.
+
+- **Clips:** start an empty clip (from the rest pose) or one from the pose on screen, import one of the preview character's own clips (its mocap Idle, Walk, Run…), or import from [Mesh2Motion](https://github.com/Mesh2Motion/mesh2motion-app)'s 178 free (CC0) human animations, retargeted to tinyimgen's skeleton. An imported clip's motion becomes its *base*, and your keys are corrections on top of it.
+- **Posing:** click a joint, then rotate it with the gizmo (`E`) or type the angles. The hips can also be moved (`W`). Posing keys the current frame. `K` keys the selected bone, `Shift+K` the whole pose, `M` mirrors the pose left to right, and `Ctrl+C` / `Ctrl+V` copy and paste poses.
+- **Timeline:** scrub on the ruler, click keys to select them (`Shift` adds), drag them to retime, and `Delete` removes them. Keys are smoothed (Catmull-Rom) or linear, and looping clips wrap around. `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo.
+- **In the playtest:** clips named `Idle`, `Walk`, `Run`, `WalkBackward`, `StrafeLeft` or `StrafeRight` replace the character's own clip of that name. The rest play on keys `1`–`9` in library order: the character stands still while one plays, a one-shot fades out at its end, and a loop runs until you move or press its key again. Closing the editor with changes reloads an open playtest tab.
+
+### Play mode
+
+**▶ Play** (or `Ctrl+P`) runs the playtest inside the editor's viewport, so you can try things without leaving it. It's the same game as in a tab, with the same scripts, player controller, animation and physics. It starts playing as soon as it loads: the keyboard works right away, and clicking the game captures the mouse for looking around. There's no pop-up at any point: `Esc` frees the mouse, and a second `Esc` (or `Ctrl+P`, or **⏹ Stop**) returns to editing. The bar above the game pauses it, restarts it, opens it in a tab (**↗**, also next to ▶ Play), and shows the **Console**: what scripts write with `this.game.log(…)`, plus warnings and errors (an error opens the console).
+
+The editor stays usable while the game runs. Edits to the map show up after **↻ Restart**, which says *edited* when there's something new. Saving a script reloads the game straight away.
+
+### Playtest (▶ Play / ↗)
+
+The map starts playing as soon as it loads, with no "click to play" screen (only a small "Loading map…" label while it loads). Keys work straight away. Click the game to capture the mouse for looking around. `Esc` frees the mouse and opens the menu (character, view), and `Esc` again closes it.
 
 - **First or third person:** switch with `V` or on the pause card. In third person the mouse orbits the camera, the wheel zooms, and the camera pulls in instead of clipping through walls. `T` switches facing between *free turn* (the character turns toward where it walks) and *strafe* (it faces the camera; A/D strafe, S walks backwards).
 - **Character:** pick one on the pause card. Your choice is remembered. If the map has a character under its Player Spawn (see above), that one is used.
@@ -142,11 +244,12 @@ Each collider is oriented with its object (rotation and scale) and built from th
   "tinyimgen": { "id": "1791…", "role": "character" | "prop" },             // models pulled from tinyimgen
   "rig": { "sockets": ["LeftHand_Socket", "RightHand_Socket"] },            // rigged models
   "grip": { "hands": 1, "hold": "upright", "fingers": {…}, "arms": "animated", "carry": null }, // holdable props (grip.json)
-  "marker": "spawn" | "waypoint" | "trigger" | "pointLight"                 // markers
+  "marker": "spawn" | "waypoint" | "trigger" | "pointLight",                // markers
+  "scripts": [{ "script": "a1b2…", "name": "Door", "params": { "angle": 90 } }] // attached scripts (sources on the root)
 }
 ```
 
-The scene root's `userData` has `{ mapFormat, version, name, environment, terrain: { size, segments } }`.
+The scene root's `userData` has `{ mapFormat, version, name, environment, terrain: { size, segments }, scripts: { id: { name, source } }, clips: [animation clips] }`. Rigged models' `rig` also records `restHips`, which the animator needs because models are exported in the editor's pose.
 Terrain vertices form a grid: `index = iz * (segments + 1) + ix`, `x = ix * size / segments - size / 2` (z is the same).
 
 ### Notes
@@ -164,7 +267,9 @@ Terrain vertices form a grid: `index = iz * (segments + 1) + ix`, `x = ix * size
 src/editor/   Editor core: Terrain, Primitives, Markers, Entities, AssetLibrary, History, Project, Export, Rig, Tinyimgen
 src/ui/       Panels, Inspector, DOM helpers
 src/core/     Shared helpers, including the tinyimgen client (tinyimgen.js)
-src/runtime/  MapLoader.js: drop-in loader for your game; hold.js + props.js: props held in a character's hand
+src/runtime/  MapLoader.js: drop-in loader for your game; scripts.js: runs the map's scripts; animator.js: clips + state machines for characters;
+              PlayerController.script.js: the default player controller; hold.js + props.js: props held in a character's hand
+src/anim/     Animation editor: clip library + evaluation (clips.js), skeleton, Mesh2Motion retargeting, AnimEditor
 src/game/     First-person playtest demo (game.html)
 public/       Draco + Basis decoders for compressed GLBs
 ```

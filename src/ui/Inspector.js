@@ -9,6 +9,8 @@ import { entityRig, entityProp, isHandSocket, socketForHand, holdData } from '..
 import { FINGERS, curlValue } from '../runtime/props.js';
 import { DEFAULT_FINGERS } from '../runtime/hold.js';
 import { tinyimgenCatalog, importTinyimgen } from '../editor/Tinyimgen.js';
+import CONTROLLER_SOURCE from '../runtime/PlayerController.script.js?raw';
+import { TEMPLATES } from '../editor/Scripts.js';
 
 const DEG = THREE.MathUtils.RAD2DEG, RAD = THREE.MathUtils.DEG2RAD;
 
@@ -26,6 +28,7 @@ export class Inspector {
     // children added or removed (e.g. the spawn's player model) change what the selection's sections show
     editor.on('sceneChanged', () => { if (!this._selfCommit) this._renderSoon(); });
     editor.on('terrainChanged', () => { if (!editor.selected) this.render(); });
+    editor.on('scriptsChanged', () => { if (editor.selected) this._renderSoon(); });
     this.render();
   }
 
@@ -208,12 +211,18 @@ export class Inspector {
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(this._paramRow(obj, p));
       }
-      if (e.type === 'spawn') {
+      // A spawn with a player controller script keeps its movement and camera settings in the script's params.
+      const controller = e.type === 'spawn' && ed.scripts ? e.scripts.find((r) => ed.scripts.isController(r.id)) : null;
+      if (e.type === 'spawn' && !controller) {
         groups.get('Movement')?.push(h('p', { class: 'hint' }, 'Used by ▶ Play and exported in this node\'s userData.params. Walk and run speeds apply in first person; in third person the character moves at its animation\'s speed.'));
       }
       for (const [title, rows] of groups) {
+        if (controller && (title === 'Camera' || title === 'Movement')) continue;
         this.root.append(section(title, rows, { open: title !== 'Movement' }));
-        if (e.type === 'spawn' && title === MARKERS.spawn.label) this._playerSection(obj).forEach((el) => this.root.append(el));
+        if (e.type === 'spawn' && title === MARKERS.spawn.label) {
+          this._playerSection(obj).forEach((el) => this.root.append(el));
+          if (ed.scripts) this.root.append(this._controllerSection(obj, controller));
+        }
       }
     } else if (e.kind === 'asset') {
       const asset = ed.assets.get(e.assetId);
@@ -240,6 +249,7 @@ export class Inspector {
       ]));
     }
 
+    if (ed.scripts) this.root.append(this._scriptsSection(obj));
     this.root.append(this._gameSection(obj));
     this.root.append(h('div', { class: 'btn-row insp-actions' },
       button('Duplicate', () => ed.duplicateSelected(), { title: 'Ctrl+D' }),
@@ -457,6 +467,88 @@ export class Inspector {
       row('Shading', checkbox({ value: m.flatShading, onChange: set('flatShading', true), label: 'Flat' }),
         checkbox({ value: m.doubleSided, onChange: set('doubleSided', true), label: 'Double-sided' })),
     ]);
+  }
+
+  /** The spawn's player controller: the script with the movement, camera and view code (and their settings). */
+  _controllerSection(obj, controller) {
+    const ed = this.editor, lib = ed.scripts;
+    if (controller) {
+      return section('Player controller', [
+        h('p', { class: 'hint' }, `Movement, camera and view settings are the “${lib.get(controller.id)?.name}” script's fields below; its code is how the player moves.`),
+        h('div', { class: 'btn-row' }, button('Edit the code', () => ed.emit('openScript', controller.id), { cls: 'btn-sm' })),
+      ]);
+    }
+    const make = () => {
+      // the spawn's current settings carry over: the script's params use the same names
+      const id = (lib.list().find((s) => lib.isController(s.id) && s.name === 'Player controller') ?? lib.add({ name: 'Player controller', source: CONTROLLER_SOURCE })).id;
+      const keys = MARKERS.spawn.params.filter((p) => p.section).map((p) => p.key);
+      this.edit(obj, (en) => { en.scripts.push({ id, params: Object.fromEntries(keys.map((k) => [k, en.params[k]])) }); }, true, { refresh: false });
+      this.render();
+    };
+    return section('Player controller', [
+      h('p', { class: 'hint' }, 'The playtest moves the player with a built-in controller script and the Movement / Camera settings above. Make it this map\'s own script to change how the player moves, looks and jumps.'),
+      h('div', { class: 'btn-row' }, button('Make a player controller script', make, { cls: 'btn-sm btn-primary' })),
+    ]);
+  }
+
+  /** Scripts attached to the object, with a field per declared param (values are this object's). */
+  _scriptsSection(obj) {
+    const ed = this.editor, lib = ed.scripts, refs = obj.entity.scripts;
+    const setParam = (i, key, commit) => (v) => this.edit(obj, (en) => { en.scripts[i].params = { ...en.scripts[i].params, [key]: v }; }, commit, { refresh: false });
+    const field = (i, key, def, value) => {
+      const opts = (def.options ?? []).map((o) => (Array.isArray(o) ? o.map(String) : [String(o), String(o)]));
+      const c = def.type === 'number' ? numberInput({ value: Number(value) || 0, step: def.step ?? 0.1, min: def.min, max: def.max, onChange: setParam(i, key, true) })
+        : def.type === 'bool' ? checkbox({ value: !!value, onChange: setParam(i, key, true) })
+        : def.type === 'color' ? colorInput({ value, onInput: setParam(i, key, false), onChange: setParam(i, key, true) })
+        : def.type === 'select' ? select({ value: String(value), options: opts, onChange: setParam(i, key, true) })
+        : def.type === 'clip' ? select({ // a clip from the animation library (plus the characters' own Idle, Walk…)
+          value: String(value ?? ''),
+          options: [...new Set(['', ...(ed.clips?.clips.map((c) => c.name) ?? []), 'Idle', 'Walk', 'Run', String(value ?? '')])].map((n) => [n, n || '(none)']),
+          onChange: setParam(i, key, true),
+        })
+        : textInput({ value, onChange: setParam(i, key, true) });
+      const r = row(def.label, c);
+      if (def.title) r.title = def.title;
+      return r;
+    };
+    const items = refs.map((ref, i) => {
+      const script = lib.get(ref.id);
+      const hooks = h('small', { class: 'muted' });
+      const fields = h('div');
+      const box = h('div', { class: 'script-ref-box' },
+        h('div', { class: 'script-ref-head' },
+          h('b', { title: script?.path ?? 'The script was deleted' }, script?.name ?? 'Missing script'), hooks,
+          script ? button('Edit', () => ed.emit('openScript', ref.id), { cls: 'btn-sm' }) : null,
+          button('✕', () => { this.edit(obj, (en) => { en.scripts.splice(i, 1); }, true, { refresh: false }); this.render(); }, { cls: 'btn-sm btn-ghost', title: 'Remove from this object' })),
+        fields);
+      if (script) {
+        lib.meta(ref.id).then((meta) => {
+          if (meta.error) { fields.replaceChildren(h('p', { class: 'hint error' }, `⚠ ${meta.error}`)); return; }
+          hooks.textContent = meta.hooks.join(' · ');
+          fields.replaceChildren(...Object.entries(meta.fields).map(([key, def]) => field(i, key, def, ref.params?.[key] ?? def.default)));
+        });
+      }
+      return box;
+    });
+    // a script file from the project, a new one, or an engine template (copied into scripts/ first)
+    const add = select({
+      value: '',
+      options: [
+        ['', '+ Add script…'],
+        ...lib.list().filter((s) => !refs.some((r) => r.id === s.id)).sort((a, b) => a.path.localeCompare(b.path)).map((s) => [s.id, s.path.replace(/^scripts\//, '')]),
+        ['$new', 'New script…'],
+        ...TEMPLATES.filter((t) => t.name !== 'Empty').map((t) => [`tpl:${t.name}`, `From template: ${t.name}`]),
+      ],
+      onChange: (v) => {
+        if (!v) return;
+        const tpl = v.startsWith('tpl:') && TEMPLATES.find((t) => t.name === v.slice(4));
+        const id = v === '$new' ? lib.add({ name: 'New script' }).id : tpl ? lib.add({ name: tpl.name, source: tpl.source }).id : v;
+        this.edit(obj, (en) => { en.scripts.push({ id, params: {} }); }, true, { refresh: false });
+        if (v === '$new') ed.emit('openScript', id);
+        this.render();
+      },
+    });
+    return section(refs.length ? `Scripts (${refs.length})` : 'Scripts', [...items, add]);
   }
 
   _gameSection(obj) {

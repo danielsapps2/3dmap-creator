@@ -44,6 +44,7 @@ export function createEntity(spec, assets) {
     material: null,
     props: { ...defaultProps(kind, spec.type), ...structuredClone(spec.props ?? {}) },
     shadow: { cast: kind !== 'marker' && kind !== 'group', receive: kind !== 'marker' && kind !== 'group', ...spec.shadow },
+    scripts: structuredClone(spec.scripts ?? []), // [{ id: script id (editor/Scripts.js), params: {} }]
   };
   let obj;
 
@@ -250,6 +251,7 @@ export function serializeEntity(obj) {
     material: e.material ? { ...e.material } : null,
     props: structuredClone(e.props),
     shadow: { ...e.shadow },
+    scripts: structuredClone(e.scripts ?? []),
   };
 }
 
@@ -269,6 +271,7 @@ export function applyEntityState(obj, s) {
   e.material = s.material ? { ...s.material } : null;
   e.props = structuredClone(s.props);
   e.shadow = { ...s.shadow };
+  e.scripts = structuredClone(s.scripts ?? []);
   refreshEntity(obj);
 }
 

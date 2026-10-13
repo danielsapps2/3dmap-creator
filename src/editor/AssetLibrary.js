@@ -5,6 +5,7 @@ import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { clone as skeletonClone } from 'three/addons/utils/SkeletonUtils.js';
 import { uid, stripExt } from '../core/utils.js';
+import { fileStem, uniquePath } from '../core/paths.js';
 
 /** Holds imported GLB files. Placed objects are clones of an asset's source scene. */
 export class AssetLibrary extends EventTarget {
@@ -25,7 +26,30 @@ export class AssetLibrary extends EventTarget {
    *   rig:  { bones: [names], sockets: [names] } when it has a skeleton (characters), else null
    *   prop: { hands, hold, grip } when it has a Grip_Primary node (holdable props), else null
    */
-  async add(fileName, buffer, id = uid(), meta = {}) {
+  /** path: where the model lives in the project ("assets/knight.glb"); a free one under assets/ by default. */
+  async add(fileName, buffer, id = uid(), meta = {}, path = null) {
+    const ext = /\.gltf$/i.test(fileName) ? '.gltf' : '.glb';
+    path ??= uniquePath('assets', fileStem(stripExt(fileName)), ext, this.list().map((a) => a.path));
+    const asset = { id, fileName, path, ...await this._parse(fileName, buffer, meta) };
+    this.assets.set(id, asset);
+    this.dispatchEvent(new Event('changed'));
+    return asset;
+  }
+
+  /**
+   * Swap an asset's model for a new version (e.g. a prop re-saved in tinyimgen), keeping its id. The asset object
+   * is updated in place; objects already placed keep the old model until they are re-instantiated
+   * (Editor.reloadAsset does that).
+   */
+  async replace(id, buffer, meta) {
+    const asset = this.assets.get(id);
+    if (!asset) throw new Error(`Missing asset "${id}"`);
+    Object.assign(asset, await this._parse(asset.fileName, buffer, meta ?? asset.meta));
+    this.dispatchEvent(new Event('changed'));
+    return asset;
+  }
+
+  async _parse(fileName, buffer, meta) {
     const gltf = await this.loader.parseAsync(buffer.slice(0), '');
     const scene = gltf.scene ?? gltf.scenes[0];
     scene.updateMatrixWorld(true);
@@ -35,10 +59,8 @@ export class AssetLibrary extends EventTarget {
     const box = new THREE.Box3().setFromObject(scene);
     const size = box.isEmpty() ? new THREE.Vector3(1, 1, 1) : box.getSize(new THREE.Vector3());
     const center = box.isEmpty() ? new THREE.Vector3() : box.getCenter(new THREE.Vector3());
-    const asset = {
-      id,
+    const parsed = {
       name: stripExt(fileName),
-      fileName,
       buffer,
       scene,
       animations: gltf.animations ?? [],
@@ -49,13 +71,24 @@ export class AssetLibrary extends EventTarget {
       rig: rigInfo(scene),
       prop: propInfo(scene, meta),
     };
-    try { asset.thumbnail = this._makeThumbnail(scene, box); } catch (e) { console.warn('thumbnail failed', e); }
-    this.assets.set(id, asset);
-    this.dispatchEvent(new Event('changed'));
-    return asset;
+    try { parsed.thumbnail = this._makeThumbnail(scene, box); } catch (e) { console.warn('thumbnail failed', e); }
+    return parsed;
   }
 
   get(id) { return this.assets.get(id); }
+
+  byPath(path) { return this.list().find((a) => a.path?.toLowerCase() === path.toLowerCase()) ?? null; }
+
+  /** Rename a model (its file follows, in the same folder). */
+  rename(id, name) {
+    const a = this.assets.get(id);
+    if (!a || !name.trim()) return;
+    const dir = a.path.slice(0, a.path.lastIndexOf('/'));
+    a.name = name.trim();
+    a.fileName = `${a.name}${a.path.slice(a.path.lastIndexOf('.'))}`;
+    a.path = uniquePath(dir, fileStem(a.name), a.path.slice(a.path.lastIndexOf('.')), this.list().filter((x) => x !== a).map((x) => x.path));
+    this.dispatchEvent(new Event('changed'));
+  }
 
   /** The library's copy of a tinyimgen model, if it was imported already. */
   findTinyimgen(id, role) {
